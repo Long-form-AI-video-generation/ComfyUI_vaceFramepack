@@ -30,19 +30,28 @@ class WanVACEVideoFramepackSampler2:
     @classmethod
     def INPUT_TYPES(s):
         return {
-             "required": {
+            "required": {
                 "model": ("WANVIDEOMODEL",),
                 "vae": ("WANVAE",),
+                # Remove the single positiveprompts input
+                # "positiveprompts": ("POSITIVEPROMPT"),
                 "steps": ("INT", {"default": 30, "min": 1, "max": 200}),
                 "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "scheduler": (["dpm++", "unipc", "euler", "deis", "lcm"], {"default": "unipc"}),
-                "text_embeds": ("WANVIDEOTEXTEMBEDS",),
+                # Remove single text_embeds, will be handled per section
+                # "text_embeds": ("WANVIDEOTEXTEMBEDS",),
                 "num_frames": ("INT", {"default": 81, "min": 41, "max": 1000, "step": 1}),
                 "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8}),
                 "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 8}),
                 "force_offload": ("BOOLEAN", {"default": True}),
+                # Add multi-prompt support
+                "multi_prompts": ("STRING", {
+                    "default": "A person walking in a park\nThe person starts jogging\nThe person runs faster\nThe person slows down to rest", 
+                    "multiline": True
+                }),
+                "encode_prompts": ("BOOLEAN", {"default": True}),  # Whether to encode prompts internally
             },
             "optional": {
                 "sigmas": ("SIGMAS",),
@@ -50,9 +59,11 @@ class WanVACEVideoFramepackSampler2:
                 "input_frames": ("VIDEO",),
                 "input_mask": ("MASK",),
                 "negative_prompt": ("STRING", {"default": "", "multiline": True}),
+                # Optional: pre-encoded embeddings for each section
+                "text_embeds_list": ("LIST",),  # List of WANVIDEOTEXTEMBEDS
+                "wan_t5_model": ("WANTEXTENCODER",),  # Optional text encoder
             }
         }
-    
     RETURN_TYPES = ("LATENT", "VIDEO")
     RETURN_NAMES = ("samples", "decoded_video")
     FUNCTION = "process"
@@ -66,15 +77,123 @@ class WanVACEVideoFramepackSampler2:
         self.INITIAL_FRAMES = 81
         self.cache_state = None
         
-    def process(self, model, vae, steps, cfg, shift, seed, scheduler, text_embeds, 
-                num_frames, width, height, force_offload, 
-                ref_images=None, input_frames=None, input_mask=None, 
-                negative_prompt="", sigmas=None, start_step=0, end_step=-1):
-        """Main processing function for ComfyUI"""
+    def parse_multi_prompts(self, multi_prompts, num_sections):
+        """
+        Parse multi-line prompts and assign them to sections.
+        Each line represents a prompt for a section.
+        If fewer prompts than sections, the last prompt is repeated.
+        """
+        # Split by newline and filter empty lines
+        prompts = [p.strip() for p in multi_prompts.split('\n') if p.strip()]
         
-        # Setup device and model
-        device= mm.get_torch_device()
-        self.device=device
+        if not prompts:
+            raise ValueError("No prompts provided in multi_prompts")
+        
+        # Assign prompts to sections
+        section_prompts = []
+        for section in range(num_sections):
+            if section < len(prompts):
+                section_prompts.append(prompts[section])
+            else:
+                # Repeat the last prompt for remaining sections
+                section_prompts.append(prompts[-1])
+        
+        print(f"Parsed {len(prompts)} unique prompts for {num_sections} sections")
+        for i, prompt in enumerate(section_prompts):
+            print(f"  Section {i}: {prompt[:50]}...")
+        
+        return section_prompts
+    def encode_prompt_for_section(self, prompt, negative_prompt, text_encoder=None, device=None):
+        """
+        Encode a single prompt for a section using the WAN Video text encoder.
+        Supports weighted prompts using (text:weight) syntax.
+        """
+        if device is None:
+            device = self.device
+        
+        if text_encoder is None:
+            raise ValueError("Text encoder is required for encoding prompts")
+        
+        # Extract the encoder model and dtype
+        encoder = text_encoder["model"]
+        dtype = text_encoder["dtype"]
+        
+        # Split positive prompts by '|' and process weights
+        positive_prompts_raw = [p.strip() for p in prompt.split('|')]
+        positive_prompts = []
+        all_weights = []
+        
+        for p in positive_prompts_raw:
+            cleaned_prompt, weights = self.parse_prompt_weights(p)
+            positive_prompts.append(cleaned_prompt)
+            all_weights.append(weights)
+        
+        # Move encoder to device
+        encoder.model.to(device)
+        
+        try:
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=True):
+                # Encode positive and negative prompts
+                context = encoder(positive_prompts, device)
+                context_null = encoder([negative_prompt if negative_prompt else ""], device)
+                
+                # Apply weights to embeddings if any were extracted
+                for i, weights in enumerate(all_weights):
+                    if weights:  # Only apply if weights exist
+                        for text, weight in weights.items():
+                            log.info(f"Applying weight {weight} to prompt: {text}")
+                            context[i] = context[i] * weight
+        finally:
+            # Always move encoder back to CPU to free VRAM
+            offload_device = mm.unet_offload_device()
+            encoder.model.to(offload_device)
+            mm.soft_empty_cache()
+        
+        # Create the embedding dictionary with all required fields for WAN Video
+        prompt_embeds_dict = {
+            "prompt_embeds": context,
+            "negative_prompt_embeds": context_null,
+            "nag_params": {},  # Add this for compatibility
+            "nag_prompt_embeds": None,  # Add this for compatibility
+            "prompt_text": prompt,  # Store original prompt for reference
+            "negative_prompt_text": negative_prompt or ""
+        }
+        
+        return prompt_embeds_dict
+
+    def parse_prompt_weights(self, prompt):
+        """
+        Parse prompt weights in the format (text:weight).
+        Returns cleaned prompt and weight dictionary.
+        """
+        import re
+        
+        weights = {}
+        cleaned_prompt = prompt
+        
+        # Pattern to find (text:weight) format
+        pattern = r'\(([^:)]+):([0-9.]+)\)'
+        matches = re.findall(pattern, prompt)
+        
+        for text, weight_str in matches:
+            try:
+                weight = float(weight_str)
+                weights[text.strip()] = weight
+                # Remove the weight notation from the prompt
+                cleaned_prompt = cleaned_prompt.replace(f"({text}:{weight_str})", text)
+            except ValueError:
+                log.warning(f"Invalid weight value: {weight_str}")
+        
+        return cleaned_prompt.strip(), weights
+    def process(self, model, vae, steps, cfg, shift, seed, scheduler,
+            num_frames, width, height, force_offload, multi_prompts,
+            encode_prompts=True, ref_images=None, input_frames=None, 
+            input_mask=None, negative_prompt="", sigmas=None, 
+            text_embeds_list=None, wan_t5_model=None, start_step=0, end_step=-1):
+        """Main processing function for ComfyUI with multi-prompt support"""
+        text_encoder= wan_t5_model
+        device = mm.get_torch_device()
+        self.device = device
         offload_device = mm.unet_offload_device()
         
         # Extract model components
@@ -82,7 +201,6 @@ class WanVACEVideoFramepackSampler2:
         model_wrapper = model_obj.diffusion_model
         
         # Move models to device
-        
         self.vae = vae.to(device).to(torch.float32)
         self.vae.dtype = torch.float32 
         model_wrapper.to(device)
@@ -90,63 +208,117 @@ class WanVACEVideoFramepackSampler2:
         # Ensure dimensions are multiples of 16
         width = (width // 16) * 16
         height = (height // 16) * 16
-         
         
-        latents = self._generate_with_framepack(
-            model_wrapper=model_wrapper,
-            text_embeds=text_embeds,
-            input_frames=input_frames,
-            input_masks=input_mask,
-            ref_images=ref_images,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            shift=shift,
-            scheduler_name=scheduler,
-            steps=steps,
-            cfg=cfg,
-            seed=seed,
-            sigmas=sigmas,
-            device=device,
-            offload_device=offload_device,
-            force_offload=force_offload
-        )
+        if True:
+            # Multi-prompt mode - encode each prompt
+            print("Multi-prompt mode activated")
+            
+            # Calculate number of sections
+            INITIAL_FRAMES = 121
+            if num_frames <= INITIAL_FRAMES:
+                num_sections = 1
+            else:
+                num_sections = math.ceil(num_frames / INITIAL_FRAMES)
+            
+            # Parse and encode prompts for each section
+            section_prompts = self.parse_multi_prompts(multi_prompts, num_sections)
+            
+            # Encode each prompt if we have a text encoder
+            if text_encoder is not None:
+                print("Encoding prompts for each section...")
+                section_text_embeds = []
+                for i, prompt in enumerate(section_prompts):
+                    print(f"Encoding prompt {i+1}/{num_sections}: {prompt[:50]}...")
+                    text_embed = self.encode_prompt_for_section(
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        text_encoder=text_encoder,
+                        device=device
+                    )
+                    section_text_embeds.append(text_embed)
+            elif text_embeds_list:
+                # Use pre-encoded embeddings if provided
+                section_text_embeds = text_embeds_list
+            else:
+                # Fallback: use base embeddings for all sections
+                print("Warning: No text encoder available, using base embeddings for all sections")
+                section_text_embeds = [text_embeds] * num_sections
+            
+            latents = self._generate_with_framepack_multi(
+                model_wrapper=model_wrapper,
+                section_text_embeds=section_text_embeds,
+                section_prompts=section_prompts,
+                input_frames=input_frames,
+                input_masks=input_mask,
+                ref_images=ref_images,
+                width=width,
+                height=height,
+                num_frames=num_frames,
+                shift=shift,
+                scheduler_name=scheduler,
+                steps=steps,
+                cfg=cfg,
+                seed=seed,
+                sigmas=sigmas,
+                device=device,
+                offload_device=offload_device,
+                force_offload=force_offload
+            )
+        else:
+            # Original single-prompt mode
+            print("Single prompt mode")
+            latents = self._generate_with_framepack(
+                model_wrapper=model_wrapper,
+                text_embeds=text_embeds,
+                input_frames=input_frames,
+                input_masks=input_mask,
+                ref_images=ref_images,
+                width=width,
+                height=height,
+                num_frames=num_frames,
+                shift=shift,
+                scheduler_name=scheduler,
+                steps=steps,
+                cfg=cfg,
+                seed=seed,
+                sigmas=sigmas,
+                device=device,
+                offload_device=offload_device,
+                force_offload=force_offload
+            )
         
-        # Decode latents to video
-        # decoded_video = self.decode_latents(latents, device)
-        
-        # Prepare outputs for ComfyUI
-        output_latent = {"samples": latents}
-        return ({
-            "samples": latents.unsqueeze(0).cpu()
-            }, )
-        return (output_latent, decoded_video)
+        return ({"samples": latents.unsqueeze(0).cpu()}, )
 
-    def _generate_with_framepack(self, model_wrapper, text_embeds, input_frames, 
-                                 input_masks, ref_images, width, height, num_frames,
-                                 shift, scheduler_name, steps, cfg, seed, sigmas,
-                                 device, offload_device, force_offload):
-        """Core FramePack generation algorithm"""
+    def _generate_with_framepack_multi(self, model_wrapper, section_text_embeds, 
+                                   section_prompts, input_frames, input_masks, 
+                                   ref_images, width, height, num_frames,
+                                   shift, scheduler_name, steps, cfg, seed, sigmas,
+                                   device, offload_device, force_offload):
+        """Core FramePack generation algorithm with multi-prompt support"""
         vae_dtype = torch.float32
         all_generated_latents = []  
         accumulated_latents = [] 
-        total_output_frames=0
+        total_output_frames = 0
 
         LATENT_WINDOW = 41  
         GENERATION_FRAMES = 30
         CONTEXT_FRAMES = 11
-        INITIAL_FRAMES=121
-        # frame_num=300
-        section_window = 41 
-        # Calculate target shape for latents
+        INITIAL_FRAMES = 81
         
-        num_sections =2
+        if num_frames <= INITIAL_FRAMES:
+            num_sections = 1
+        else:
+            num_sections = math.ceil(num_frames / INITIAL_FRAMES)
         
         for section in range(num_sections):
-            print(f"[Section {section+1}/{num_sections}]")
+            print(f"\n[Section {section+1}/{num_sections}]")
+            print(f"Using prompt: {section_prompts[section][:100]}...")
+            
+            # Get text embeddings for this section
+            text_embeds = section_text_embeds[section]
             if section == 0:
             
-                input_frames = torch.zeros(1,3, num_frames, height, width, device=device, dtype=vae_dtype)
+                input_frames = torch.zeros(1,3, INITIAL_FRAMES , height, width, device=device, dtype=vae_dtype)
                 input_masks = torch.ones_like(input_frames, device=device, dtype=vae_dtype)
                 
                 # Normalize to [-1, 1] range for VAE
