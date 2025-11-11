@@ -20,7 +20,13 @@ from .wanvideo.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .wanvideo.utils.basic_flowmatch import FlowMatchScheduler
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DEISMultistepScheduler
 from .wanvideo.utils.scheduling_flow_match_lcm import FlowMatchLCMScheduler
+import time
+import psutil
 
+
+from datetime import datetime
+import json
+import os
 
 from einops import rearrange
 
@@ -76,7 +82,228 @@ class WanVACEVideoFramepackSampler2:
         self.CONTEXT_FRAMES = 11
         self.INITIAL_FRAMES = 81
         self.cache_state = None
+        self.benchmark_data = {}
         
+        
+    import psutil
+    import torch
+    from pynvml import (
+        nvmlInit, nvmlShutdown, nvmlDeviceGetCount,
+        nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo,
+        nvmlDeviceGetUtilizationRates
+    )
+
+    def get_memory_stats(self):
+        """Get current memory statistics"""
+        stats = {}
+
+        # CPU memory (process)
+        process = psutil.Process()
+        stats["cpu_memory_mb"] = process.memory_info().rss / 1024 / 1024
+        stats["cpu_memory_percent"] = process.memory_percent()
+
+        # System memory
+        mem = psutil.virtual_memory()
+        stats["system_memory_total_gb"] = mem.total / 1024**3
+        stats["system_memory_used_gb"] = mem.used / 1024**3
+        stats["system_memory_percent"] = mem.percent
+
+        # GPU stats (if CUDA available)
+        if torch.cuda.is_available():
+            stats["gpu_memory_allocated_gb"] = torch.cuda.memory_allocated() / 1024**3
+            stats["gpu_memory_reserved_gb"] = torch.cuda.memory_reserved() / 1024**3
+
+            try:
+                nvmlInit()
+                device_count = nvmlDeviceGetCount()
+                if device_count > 0:
+                    handle = nvmlDeviceGetHandleByIndex(0)  # first GPU
+                    mem_info = nvmlDeviceGetMemoryInfo(handle)
+                    stats["gpu_memory_total_gb"] = mem_info.total / 1024**3
+                    stats["gpu_memory_used_gb"] = mem_info.used / 1024**3
+                    util = nvmlDeviceGetUtilizationRates(handle)
+                    stats["gpu_utilization_percent"] = util.gpu
+            except Exception as e:
+                print(f"GPU stats error: {e}")
+            finally:
+                try:
+                    nvmlShutdown()
+                except:
+                    pass
+        else:
+            stats.update({
+                "gpu_memory_allocated_gb": 0,
+                "gpu_memory_reserved_gb": 0,
+                "gpu_memory_total_gb": 0,
+                "gpu_memory_used_gb": 0,
+                "gpu_utilization_percent": 0,
+            })
+
+        return stats
+
+
+    
+    def benchmark_section(self, section_id, phase_name):
+        """Start or end benchmarking for a section phase"""
+        if not hasattr(self, 'section_benchmarks'):
+            self.section_benchmarks = {}
+        
+        if section_id not in self.section_benchmarks:
+            self.section_benchmarks[section_id] = {}
+        
+        phase_key = f"{phase_name}_start"
+        phase_end_key = f"{phase_name}_end"
+        
+        if phase_key not in self.section_benchmarks[section_id]:
+            # Starting phase
+            self.section_benchmarks[section_id][phase_key] = time.time()
+            self.section_benchmarks[section_id][f"{phase_name}_memory_start"] = self.get_memory_stats()
+        else:
+            # Ending phase
+            self.section_benchmarks[section_id][phase_end_key] = time.time()
+            self.section_benchmarks[section_id][f"{phase_name}_memory_end"] = self.get_memory_stats()
+            
+            # Calculate duration
+            duration = self.section_benchmarks[section_id][phase_end_key] - self.section_benchmarks[section_id][phase_key]
+            self.section_benchmarks[section_id][f"{phase_name}_duration"] = duration
+            
+            # Calculate memory delta
+            start_mem = self.section_benchmarks[section_id][f"{phase_name}_memory_start"]
+            end_mem = self.section_benchmarks[section_id][f"{phase_name}_memory_end"]
+            
+            if 'gpu_memory_allocated_gb' in start_mem and 'gpu_memory_allocated_gb' in end_mem:
+                gpu_delta = end_mem['gpu_memory_allocated_gb'] - start_mem['gpu_memory_allocated_gb']
+                self.section_benchmarks[section_id][f"{phase_name}_gpu_memory_delta_gb"] = gpu_delta
+            
+            cpu_delta = end_mem['cpu_memory_mb'] - start_mem['cpu_memory_mb']
+            self.section_benchmarks[section_id][f"{phase_name}_cpu_memory_delta_mb"] = cpu_delta
+    
+    def generate_benchmark_report(self):
+        """Generate a comprehensive benchmark report"""
+        report = []
+        report.append("=" * 80)
+        report.append("FRAMEPACK VIDEO GENERATION BENCHMARK REPORT")
+        report.append("=" * 80)
+        report.append(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report.append("")
+        
+        if hasattr(self, 'overall_start_time'):
+            total_duration = time.time() - self.overall_start_time
+            report.append(f"Total Processing Time: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
+        
+        if hasattr(self, 'generation_params'):
+            report.append("\nGeneration Parameters:")
+            for key, value in self.generation_params.items():
+                report.append(f"  {key}: {value}")
+        
+        report.append("\n" + "-" * 80)
+        report.append("SECTION-BY-SECTION BREAKDOWN")
+        report.append("-" * 80)
+        
+        if hasattr(self, 'section_benchmarks'):
+            total_encoding_time = 0
+            total_denoising_time = 0
+            total_accumulation_time = 0
+            
+            for section_id in sorted(self.section_benchmarks.keys()):
+                section_data = self.section_benchmarks[section_id]
+                report.append(f"\n[Section {section_id + 1}]")
+                
+                # Prompt info
+                if hasattr(self, 'section_prompts') and section_id < len(self.section_prompts):
+                    report.append(f"Prompt: {self.section_prompts[section_id][:50]}...")
+                
+                # Timing breakdown
+                phases = ['encoding', 'denoising', 'accumulation']
+                for phase in phases:
+                    if f"{phase}_duration" in section_data:
+                        duration = section_data[f"{phase}_duration"]
+                        report.append(f"  {phase.capitalize()}: {duration:.2f}s")
+                        
+                        if phase == 'encoding':
+                            total_encoding_time += duration
+                        elif phase == 'denoising':
+                            total_denoising_time += duration
+                        elif phase == 'accumulation':
+                            total_accumulation_time += duration
+                        
+                        # Memory changes
+                        if f"{phase}_gpu_memory_delta_gb" in section_data:
+                            gpu_delta = section_data[f"{phase}_gpu_memory_delta_gb"]
+                            report.append(f"    GPU Memory Δ: {gpu_delta:+.3f} GB")
+                        
+                        if f"{phase}_cpu_memory_delta_mb" in section_data:
+                            cpu_delta = section_data[f"{phase}_cpu_memory_delta_mb"]
+                            report.append(f"    CPU Memory Δ: {cpu_delta:+.1f} MB")
+                
+                # Per-section total
+                section_total = sum([section_data.get(f"{p}_duration", 0) for p in phases])
+                report.append(f"  Section Total: {section_total:.2f}s")
+                
+                # Peak memory for section
+                if 'denoising_memory_end' in section_data:
+                    end_mem = section_data['denoising_memory_end']
+                    if 'gpu_memory_allocated_gb' in end_mem:
+                        report.append(f"  Peak GPU Memory: {end_mem['gpu_memory_allocated_gb']:.3f} GB")
+                    report.append(f"  Peak CPU Memory: {end_mem['cpu_memory_mb']:.1f} MB")
+        
+        # Summary statistics
+        report.append("\n" + "=" * 80)
+        report.append("SUMMARY STATISTICS")
+        report.append("=" * 80)
+        
+        if hasattr(self, 'section_benchmarks'):
+            num_sections = len(self.section_benchmarks)
+            report.append(f"Total Sections Processed: {num_sections}")
+            report.append(f"Total Encoding Time: {total_encoding_time:.2f}s")
+            report.append(f"Total Denoising Time: {total_denoising_time:.2f}s")
+            report.append(f"Total Accumulation Time: {total_accumulation_time:.2f}s")
+            
+            if num_sections > 0:
+                report.append(f"Average Time per Section: {(total_encoding_time + total_denoising_time + total_accumulation_time) / num_sections:.2f}s")
+                report.append(f"Average Denoising Time per Section: {total_denoising_time / num_sections:.2f}s")
+        
+        # Final memory state
+        final_memory = self.get_memory_stats()
+        report.append(f"\nFinal Memory State:")
+        if 'gpu_memory_allocated_gb' in final_memory:
+            report.append(f"  GPU Memory: {final_memory['gpu_memory_allocated_gb']:.3f} GB allocated")
+        report.append(f"  CPU Memory: {final_memory['cpu_memory_mb']:.1f} MB")
+        report.append(f"  System Memory: {final_memory['system_memory_percent']:.1f}% used")
+        
+        report.append("\n" + "=" * 80)
+        
+        return "\n".join(report)
+    
+    def save_benchmark_report(self, report, output_dir="./benchmarks"):
+        """Save benchmark report to file"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"framepack_benchmark_{timestamp}.txt"
+        filepath = os.path.join(output_dir, filename)
+        
+        with open(filepath, 'w') as f:
+            f.write(report)
+        
+        # Also save as JSON for easier analysis
+        json_filename = f"framepack_benchmark_{timestamp}.json"
+        json_filepath = os.path.join(output_dir, json_filename)
+        
+        benchmark_dict = {
+            'timestamp': timestamp,
+            'generation_params': getattr(self, 'generation_params', {}),
+            'section_benchmarks': getattr(self, 'section_benchmarks', {}),
+            'total_duration': time.time() - self.overall_start_time if hasattr(self, 'overall_start_time') else 0
+        }
+        
+        with open(json_filepath, 'w') as f:
+            json.dump(benchmark_dict, f, indent=2, default=str)
+        
+        print(f"Benchmark report saved to: {filepath}")
+        print(f"JSON data saved to: {json_filepath}")
+        
+        return filepath
     def parse_multi_prompts(self, multi_prompts, num_sections):
         """
         Parse multi-line prompts and assign them to sections.
@@ -191,6 +418,23 @@ class WanVACEVideoFramepackSampler2:
             input_mask=None, negative_prompt="", sigmas=None, 
             text_embeds_list=None, wan_t5_model=None, start_step=0, end_step=-1):
         """Main processing function for ComfyUI with multi-prompt support"""
+        enable_benchmarking=True
+        benchmark_output_dir="./benchmarks"
+       
+
+        
+        if enable_benchmarking:
+            self.overall_start_time = time.time()
+            self.generation_params = {
+                'num_frames': num_frames,
+                'width': width,
+                'height': height,
+                'steps': steps,
+                'cfg': cfg,
+                'scheduler': scheduler,
+                'seed': seed,
+            }
+            print("\n🔬 Benchmarking enabled - tracking performance metrics...")
         text_encoder= wan_t5_model
         device = mm.get_torch_device()
         self.device = device
@@ -214,7 +458,7 @@ class WanVACEVideoFramepackSampler2:
             print("Multi-prompt mode activated")
             
             # Calculate number of sections
-            INITIAL_FRAMES = 121
+            INITIAL_FRAMES = 81
             if num_frames <= INITIAL_FRAMES:
                 num_sections = 1
             else:
@@ -286,6 +530,13 @@ class WanVACEVideoFramepackSampler2:
                 offload_device=offload_device,
                 force_offload=force_offload
             )
+            
+        if enable_benchmarking:
+            report = self.generate_benchmark_report()
+            print("\n" + report)
+            self.save_benchmark_report(report, benchmark_output_dir)
+        else:
+            report = "Benchmarking disabled"
         
         return ({"samples": latents.unsqueeze(0).cpu()}, )
 
@@ -304,6 +555,7 @@ class WanVACEVideoFramepackSampler2:
         GENERATION_FRAMES = 30
         CONTEXT_FRAMES = 11
         INITIAL_FRAMES = 81
+        enable_benchmarking=True
         
         if num_frames <= INITIAL_FRAMES:
             num_sections = 1
@@ -316,6 +568,9 @@ class WanVACEVideoFramepackSampler2:
             
             # Get text embeddings for this section
             text_embeds = section_text_embeds[section]
+            
+            if enable_benchmarking:
+                self.benchmark_section(section, 'encoding')
             if section == 0:
             
                 input_frames = torch.zeros(1,3, INITIAL_FRAMES , height, width, device=device, dtype=vae_dtype)
@@ -400,6 +655,12 @@ class WanVACEVideoFramepackSampler2:
             print('zo', z0[0].shape,'mo', m0[0].shape)
             z = self.vace_latent(z0, m0)
             print('z', z[0].shape)
+            if enable_benchmarking:
+                self.benchmark_section(section, 'encoding')  # End encoding phase
+            
+            # PHASE 2: DENOISING
+            if enable_benchmarking:
+                self.benchmark_section(section, 'denoising')
             
             # Setup scheduler
             sample_scheduler = self._setup_scheduler(scheduler_name, steps, shift, device, sigmas)
@@ -501,6 +762,13 @@ class WanVACEVideoFramepackSampler2:
                 # Memory management
                 if force_offload and idx % 5 == 0:
                     mm.soft_empty_cache()
+                    
+                if enable_benchmarking:
+                    self.benchmark_section(section, 'denoising')  # End denoising phase
+            
+                # PHASE 3: ACCUMULATION
+                if enable_benchmarking:
+                    self.benchmark_section(section, 'accumulation')
             if section == 0:
                     print(f"Section 0: Removing {1} reference frames from latent")
 
