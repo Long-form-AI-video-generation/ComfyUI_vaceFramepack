@@ -85,6 +85,11 @@ class WanVACEVideoFramepackSampler2:
         self.benchmark_data = {}
         
         
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        
     import psutil
     import torch
     from pynvml import (
@@ -141,8 +146,6 @@ class WanVACEVideoFramepackSampler2:
 
         return stats
 
-
-    
     def benchmark_section(self, section_id, phase_name):
         """Start or end benchmarking for a section phase"""
         if not hasattr(self, 'section_benchmarks'):
@@ -372,7 +375,7 @@ class WanVACEVideoFramepackSampler2:
                             context[i] = context[i] * weight
         finally:
             # Always move encoder back to CPU to free VRAM
-            offload_device = mm.unet_offload_device()
+            offload_device = 'cpu'
             encoder.model.to(offload_device)
             mm.soft_empty_cache()
         
@@ -380,10 +383,6 @@ class WanVACEVideoFramepackSampler2:
         prompt_embeds_dict = {
             "prompt_embeds": context,
             "negative_prompt_embeds": context_null,
-            "nag_params": {},  # Add this for compatibility
-            "nag_prompt_embeds": None,  # Add this for compatibility
-            "prompt_text": prompt,  # Store original prompt for reference
-            "negative_prompt_text": negative_prompt or ""
         }
         
         return prompt_embeds_dict
@@ -456,7 +455,7 @@ class WanVACEVideoFramepackSampler2:
         if True:
             # Multi-prompt mode - encode each prompt
             print("Multi-prompt mode activated")
-            
+            print("multi prompt", multi_prompts)
             # Calculate number of sections
             INITIAL_FRAMES = 81
             if num_frames <= INITIAL_FRAMES:
@@ -464,9 +463,9 @@ class WanVACEVideoFramepackSampler2:
             else:
                 num_sections = math.ceil(num_frames / INITIAL_FRAMES)
             
-            # Parse and encode prompts for each section
+            # Parse and encode prompts afor each section
             section_prompts = self.parse_multi_prompts(multi_prompts, num_sections)
-            
+            print('this are the section prompts',section_prompts )
             # Encode each prompt if we have a text encoder
             if text_encoder is not None:
                 print("Encoding prompts for each section...")
@@ -541,10 +540,10 @@ class WanVACEVideoFramepackSampler2:
         return ({"samples": latents.unsqueeze(0).cpu()}, )
 
     def _generate_with_framepack_multi(self, model_wrapper, section_text_embeds, 
-                                   section_prompts, input_frames, input_masks, 
-                                   ref_images, width, height, num_frames,
-                                   shift, scheduler_name, steps, cfg, seed, sigmas,
-                                   device, offload_device, force_offload):
+                               section_prompts, input_frames, input_masks, 
+                               ref_images, width, height, num_frames,
+                               shift, scheduler_name, steps, cfg, seed, sigmas,
+                               device, offload_device, force_offload):
         """Core FramePack generation algorithm with multi-prompt support"""
         vae_dtype = torch.float32
         all_generated_latents = []  
@@ -555,7 +554,7 @@ class WanVACEVideoFramepackSampler2:
         GENERATION_FRAMES = 30
         CONTEXT_FRAMES = 11
         INITIAL_FRAMES = 81
-        enable_benchmarking=True
+        enable_benchmarking = True
         
         if num_frames <= INITIAL_FRAMES:
             num_sections = 1
@@ -569,98 +568,85 @@ class WanVACEVideoFramepackSampler2:
             # Get text embeddings for this section
             text_embeds = section_text_embeds[section]
             
+            # PHASE 1: ENCODING
             if enable_benchmarking:
                 self.benchmark_section(section, 'encoding')
+                
             if section == 0:
-            
-                input_frames = torch.zeros(1,3, INITIAL_FRAMES , height, width, device=device, dtype=vae_dtype)
+                input_frames = torch.zeros(1, 3, INITIAL_FRAMES, height, width, 
+                                        device=device, dtype=vae_dtype)
                 input_masks = torch.ones_like(input_frames, device=device, dtype=vae_dtype)
                 
                 # Normalize to [-1, 1] range for VAE
                 input_frames = [(f * 2 - 1) for f in input_frames]
                 
-                print('input_frames', input_frames[0].shape, input_frames[0].dtype)
-                print('input_masks', input_masks[0].shape, input_masks[0].dtype)
                 if ref_images is not None:
-                    # Create padded image
+                    # [ref_images processing code - same as before]
                     if ref_images.shape[0] > 1:
-                        ref_images = torch.cat([ref_images[i] for i in range(ref_images.shape[0])], dim=1).unsqueeze(0)
+                        ref_images = torch.cat([ref_images[i] for i in range(ref_images.shape[0])], 
+                                            dim=1).unsqueeze(0)
                 
                     B, H, W, C = ref_images.shape
                     current_aspect = W / H
                     target_aspect = width / height
                     if current_aspect > target_aspect:
-                        # Image is wider than target, pad height
                         new_h = int(W / target_aspect)
                         pad_h = (new_h - H) // 2
-                        padded = torch.ones(ref_images.shape[0], new_h, W, ref_images.shape[3], device=ref_images.device, dtype=ref_images.dtype)
+                        padded = torch.ones(ref_images.shape[0], new_h, W, ref_images.shape[3], 
+                                        device=ref_images.device, dtype=ref_images.dtype)
                         padded[:, pad_h:pad_h+H, :, :] = ref_images
                         ref_images = padded
                     elif current_aspect < target_aspect:
-                        # Image is taller than target, pad width
                         new_w = int(H * target_aspect)
                         pad_w = (new_w - W) // 2
-                        padded = torch.ones(ref_images.shape[0], H, new_w, ref_images.shape[3], device=ref_images.device, dtype=ref_images.dtype)
+                        padded = torch.ones(ref_images.shape[0], H, new_w, ref_images.shape[3], 
+                                        device=ref_images.device, dtype=ref_images.dtype)
                         padded[:, :, pad_w:pad_w+W, :] = ref_images
                         ref_images = padded
-                    ref_images = common_upscale(ref_images.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
-                    
-                    ref_images = ref_images.to(self.vae.dtype).to(self.device).unsqueeze(0).permute(0, 4, 1, 2, 3).unsqueeze(0)
+                        
+                    ref_images = common_upscale(ref_images.movedim(-1, 1), width, height, 
+                                            "lanczos", "center").movedim(1, -1)
+                    ref_images = ref_images.to(self.vae.dtype).to(self.device).unsqueeze(0)
+                    ref_images = ref_images.permute(0, 4, 1, 2, 3).unsqueeze(0)
                     ref_images = ref_images * 2 - 1
                     
-                    target_shape = (
-                            16,  # channels
-                            (num_frames - 1) // VAE_STRIDE[0] + 1,  # temporal dimension
-                            height // VAE_STRIDE[1],  # height in latent space
-                            width // VAE_STRIDE[2]   # width in latent space
-                        )
+                target_shape = (
+                    16,
+                    (INITIAL_FRAMES - 1) // VAE_STRIDE[0] + 1,
+                    height // VAE_STRIDE[1],
+                    width // VAE_STRIDE[2]
+                )
             else:
-                context_latent = self.build_hierarchical_context_latent(
-                        accumulated_latents, section)
-                    
-
-                    # if section_id > 1:
-                    #     appearance, motion = self.separate_appearance_and_motion(context_latent)
-                    #     motion_noise = torch.randn_like(motion) * 0.3
-                    #     motion_perturbed = motion + motion_noise
-                    #     context_decoded = [appearance + motion_perturbed * 0.5]
-
-
+                # Build context from previous sections
+                context_latent = self.build_hierarchical_context_latent(accumulated_latents, section)
                 hierarchical_frames = self.pick_context_v2(context_latent, section)
-                print('hierarchical_frames', hierarchical_frames[0].shape )
+                
                 input_frames = self.decode_latent([hierarchical_frames], None)
-                input_frames[0]= input_frames[0].expand(3, -1, -1, -1)
+                input_frames[0] = input_frames[0].expand(3, -1, -1, -1)
                 
-                print('current frames shape', input_frames[0].shape )
-                input_masks = self.create_temporal_blend_mask_v2(
-                        input_frames[0].shape, section)
-                
+                input_masks = self.create_temporal_blend_mask_v2(input_frames[0].shape, section)
                 ref_images = None
-                print('current mask shape', input_masks[0].shape )
-                num_frames=input_frames[0].shape[1] 
+                num_frames = input_frames[0].shape[1]
                 
                 target_shape = (
-                            16,  # channels
-                            (num_frames - 1) // VAE_STRIDE[0] + 1,  # temporal dimension
-                            height // VAE_STRIDE[1],  # height in latent space
-                            width // VAE_STRIDE[2]   # width in latent space
-                        )
-            
-            
-            
+                    16,
+                    (num_frames - 1) // VAE_STRIDE[0] + 1,
+                    height // VAE_STRIDE[1],
+                    width // VAE_STRIDE[2]
+                )
             
             # Encode inputs to latent space
-            z0 = self.vace_encode_frames(input_frames, ref_images=ref_images, masks=input_masks, tiled_vae=False)
+            z0 = self.vace_encode_frames(input_frames, ref_images=ref_images, 
+                                        masks=input_masks, tiled_vae=False)
             m0 = self.vace_encode_masks(input_masks, ref_images=ref_images)
-            print('zo', z0[0].shape,'mo', m0[0].shape)
             z = self.vace_latent(z0, m0)
-            print('z', z[0].shape)
+            
             if enable_benchmarking:
-                self.benchmark_section(section, 'encoding')  # End encoding phase
+                self.benchmark_section(section, 'encoding')  # End encoding
             
             # PHASE 2: DENOISING
             if enable_benchmarking:
-                self.benchmark_section(section, 'denoising')
+                self.benchmark_section(section, 'denoising')  # Start denoising
             
             # Setup scheduler
             sample_scheduler = self._setup_scheduler(scheduler_name, steps, shift, device, sigmas)
@@ -686,28 +672,15 @@ class WanVACEVideoFramepackSampler2:
             # Setup model parameters
             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
             freqs = self._setup_rope_embeddings(model_wrapper, latent.shape[1])
-            num_steps = len(timesteps)  
-
-            scale_sched = [1.0] * num_steps      
-            start_sched = [0.0] * num_steps         
-            end_sched   = [1.0] * num_steps         
+            num_steps = len(timesteps)
 
             vace_data = [{
                 "context": z,
-                "scale": scale_sched,
-                "start":0.0,
-                "end":  1.0,
-                "seq_len":  seq_len     
+                "scale": [1.0] * num_steps,
+                "start": 0.0,
+                "end": 1.0,
+                "seq_len": seq_len
             }]
-
-            # # Prepare VACE data
-            # vace_data = [{
-            #     "context": z,
-            #     "scale": 1.0,
-            #     "start": 0.0,
-            #     "end": 1.0,
-            #     "seq_len": seq_len
-            # }]
             
             # Ensure cfg is a list
             if not isinstance(cfg, list):
@@ -717,7 +690,6 @@ class WanVACEVideoFramepackSampler2:
             pbar = ProgressBar(steps)
             
             # Clear memory before generation
-            mm.unload_all_models()
             mm.soft_empty_cache()
             gc.collect()
             
@@ -726,9 +698,8 @@ class WanVACEVideoFramepackSampler2:
             
             # Main denoising loop
             for idx, t in enumerate(timesteps):
-                # Prepare inputs
                 timestep = torch.tensor([t]).to(device)
-                print(f"[Step {idx+1}/{len(timesteps)}] Starting... timestep={t.item()}")
+                
                 # Get noise prediction
                 noise_pred = self._predict_with_cfg(
                     latent=latent,
@@ -742,8 +713,6 @@ class WanVACEVideoFramepackSampler2:
                     freqs=freqs,
                     device=device
                 )
-                print(f"[Step {idx+1}] Got noise prediction: shape={noise_pred.shape}, dtype={noise_pred.dtype}")
-
                 
                 # Scheduler step
                 step_args = {"generator": generator}
@@ -759,57 +728,59 @@ class WanVACEVideoFramepackSampler2:
                 
                 pbar.update(1)
                 
-                # Memory management
-                if force_offload and idx % 5 == 0:
+                # Memory management - less frequent
+                if force_offload and idx % 10 == 0:
                     mm.soft_empty_cache()
-                    
-                if enable_benchmarking:
-                    self.benchmark_section(section, 'denoising')  # End denoising phase
             
-                # PHASE 3: ACCUMULATION
-                if enable_benchmarking:
-                    self.benchmark_section(section, 'accumulation')
+            if enable_benchmarking:
+                self.benchmark_section(section, 'denoising')  # End denoising
+            
+            # PHASE 3: ACCUMULATION
+            if enable_benchmarking:
+                self.benchmark_section(section, 'accumulation')  # Start accumulation
+            
+            # Handle accumulation based on section
             if section == 0:
-                    print(f"Section 0: Removing {1} reference frames from latent")
-
-                    if section==1:
-                        latent_without_ref =latent
-                        accumulated_latents.append(latent_without_ref)
-
-
-                        all_generated_latents.append(latent_without_ref)
-                        
-                    else: 
-                        latent_without_ref = latent[:, 1:-10, :, :]
-                        accumulated_latents.append(latent_without_ref)
-
-
-                        all_generated_latents.append(latent_without_ref)
+                if ref_images is not None:
+                    latent_without_ref = latent[:, 1:, :, :]
+                else:
+                    latent_without_ref = latent
                 
+                accumulated_latents.append(latent_without_ref)
+                all_generated_latents.append(latent_without_ref)
             else:
+                # Remove oldest section if we have too many
                 if section > 2:
                     accumulated_latents.pop(0)
-                new=latent[:, -GENERATION_FRAMES:, :, :]
+                
+                # Add new frames to accumulation
+                new = latent[:, -GENERATION_FRAMES:, :, :]
                 accumulated_latents.append(new)
-
-                if section == 0:
-                    # First section without reference images
-                    all_generated_latents.append(latent)
-                else:
-                    # Take only newly generated frames
-                    new_content = latent[:, -GENERATION_FRAMES:, :, :]
-                    new_content = new_content[:, 11:, :, :]
-                    all_generated_latents.append(new_content)
-                    frames_added = new_content.shape[1]
-                    total_output_frames += frames_added
-                    print(f"🎬 Section {section} OUTPUT: Added {frames_added} frames to final video (took last {GENERATION_FRAMES}, removed first {CONTEXT_FRAMES})")
-                    print(f"📊 Total output frames so far: {total_output_frames}")
-                        
+                
+                # Add to final output (skip overlap frames)
+                new_content = latent[:, -GENERATION_FRAMES:, :, :]
+                new_content = new_content[:, CONTEXT_FRAMES:, :, :]
+                all_generated_latents.append(new_content)
+                
+                frames_added = new_content.shape[1]
+                total_output_frames += frames_added
+                print(f"Added {frames_added} frames (total: {total_output_frames})")
+            
+            if enable_benchmarking:
+                self.benchmark_section(section, 'accumulation')  # End accumulation
+            
+            # Clear cache after section
+            if 'noise_pred' in locals(): 
+                del latent, noise_pred
+            mm.soft_empty_cache()
+            gc.collect()
+        
         # Move model to offload device if requested
         if force_offload:
             model_wrapper.to(offload_device)
             mm.soft_empty_cache()
             gc.collect()
+        
         final_latent = torch.cat(all_generated_latents, dim=1)
         return final_latent.cpu()
 
@@ -1036,9 +1007,6 @@ class WanVACEVideoFramepackSampler2:
         # No need to check ref_images length or trim anymore
         return vae.decode(zs, device=self.device)
 
-    # functions for framepack implementation
-
-
     def build_hierarchical_context_latent(self, accumulated_latents, section_id):
         """
         Build hierarchical context from accumulated latents.
@@ -1053,7 +1021,6 @@ class WanVACEVideoFramepackSampler2:
         print(f"Building context from {total_frames} accumulated frames")
 
         return all_prev
-    
     
     def pick_context_v2(self, frames, section_id, initial=False):
         """
@@ -1142,7 +1109,6 @@ class WanVACEVideoFramepackSampler2:
             print(f"  Output shape: {final_frames.shape}")
 
         return final_frames
-    
     
     def create_temporal_blend_mask_v2(self, frame_shape, section_id, initial=False):
         """
