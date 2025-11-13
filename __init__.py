@@ -22,7 +22,12 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DEISMultistepS
 from .wanvideo.utils.scheduling_flow_match_lcm import FlowMatchLCMScheduler
 import time
 import psutil
-
+import torch
+from pynvml import (
+        nvmlInit, nvmlShutdown, nvmlDeviceGetCount,
+        nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo,
+        nvmlDeviceGetUtilizationRates
+    )
 
 from datetime import datetime
 import json
@@ -77,10 +82,7 @@ class WanVACEVideoFramepackSampler2:
     DESCRIPTION = "A sampler specifically for the FramePack algorithm for long video generation using hierarchical context."
 
     def __init__(self):
-        self.LATENT_WINDOW = 41
-        self.GENERATION_FRAMES = 30
-        self.CONTEXT_FRAMES = 11
-        self.INITIAL_FRAMES = 81
+        
         self.cache_state = None
         self.benchmark_data = {}
         
@@ -89,14 +91,8 @@ class WanVACEVideoFramepackSampler2:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         
-        
-    import psutil
-    import torch
-    from pynvml import (
-        nvmlInit, nvmlShutdown, nvmlDeviceGetCount,
-        nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo,
-        nvmlDeviceGetUtilizationRates
-    )
+  
+   
 
     def get_memory_stats(self):
         """Get current memory statistics"""
@@ -415,11 +411,13 @@ class WanVACEVideoFramepackSampler2:
             num_frames, width, height, force_offload, multi_prompts,
             encode_prompts=True, ref_images=None, input_frames=None, 
             input_mask=None, negative_prompt="", sigmas=None, 
-            text_embeds_list=None, wan_t5_model=None, start_step=0, end_step=-1):
+            text_embeds_list=None, wan_t5_model=None):
         """Main processing function for ComfyUI with multi-prompt support"""
         enable_benchmarking=True
         benchmark_output_dir="./benchmarks"
-       
+        self.cache_state = None
+        self.benchmark_data = {}
+        self.section_benchmarks = {}
 
         
         if enable_benchmarking:
@@ -452,42 +450,42 @@ class WanVACEVideoFramepackSampler2:
         width = (width // 16) * 16
         height = (height // 16) * 16
         
-        if True:
-            # Multi-prompt mode - encode each prompt
-            print("Multi-prompt mode activated")
-            print("multi prompt", multi_prompts)
-            # Calculate number of sections
-            INITIAL_FRAMES = 81
-            if num_frames <= INITIAL_FRAMES:
-                num_sections = 1
-            else:
-                num_sections = math.ceil(num_frames / INITIAL_FRAMES)
+       
+        # Multi-prompt mode - encode each prompt
+        print("Multi-prompt mode activated")
+        print("multi prompt", multi_prompts)
+        # Calculate number of sections
+        INITIAL_FRAMES = 81
+        if num_frames <= INITIAL_FRAMES:
+            num_sections = 1
+        else:
+            num_sections = math.ceil(num_frames / INITIAL_FRAMES)
             
-            # Parse and encode prompts afor each section
-            section_prompts = self.parse_multi_prompts(multi_prompts, num_sections)
-            print('this are the section prompts',section_prompts )
-            # Encode each prompt if we have a text encoder
-            if text_encoder is not None:
-                print("Encoding prompts for each section...")
-                section_text_embeds = []
-                for i, prompt in enumerate(section_prompts):
-                    print(f"Encoding prompt {i+1}/{num_sections}: {prompt[:50]}...")
-                    text_embed = self.encode_prompt_for_section(
+        # Parse and encode prompts afor each section
+        section_prompts = self.parse_multi_prompts(multi_prompts, num_sections)
+        print('this are the section prompts',section_prompts )
+        # Encode each prompt if we have a text encoder
+        if text_encoder is not None:
+            print("Encoding prompts for each section...")
+            section_text_embeds = []
+            for i, prompt in enumerate(section_prompts):
+                print(f"Encoding prompt {i+1}/{num_sections}: {prompt[:50]}...")
+                text_embed = self.encode_prompt_for_section(
                         prompt=prompt,
                         negative_prompt=negative_prompt,
                         text_encoder=text_encoder,
                         device=device
                     )
-                    section_text_embeds.append(text_embed)
-            elif text_embeds_list:
-                # Use pre-encoded embeddings if provided
-                section_text_embeds = text_embeds_list
-            else:
-                # Fallback: use base embeddings for all sections
-                print("Warning: No text encoder available, using base embeddings for all sections")
-                section_text_embeds = [text_embeds] * num_sections
+                section_text_embeds.append(text_embed)
+        elif text_embeds_list:
+            # Use pre-encoded embeddings if provided
+            section_text_embeds = text_embeds_list
+        else:
+            # Fallback: use base embeddings for all sections
+            print("Warning: No text encoder available, using base embeddings for all sections")
+            section_text_embeds = [text_embeds] * num_sections
             
-            latents = self._generate_with_framepack_multi(
+        latents = self._generate_with_framepack_multi(
                 model_wrapper=model_wrapper,
                 section_text_embeds=section_text_embeds,
                 section_prompts=section_prompts,
@@ -507,29 +505,7 @@ class WanVACEVideoFramepackSampler2:
                 offload_device=offload_device,
                 force_offload=force_offload
             )
-        else:
-            # Original single-prompt mode
-            print("Single prompt mode")
-            latents = self._generate_with_framepack(
-                model_wrapper=model_wrapper,
-                text_embeds=text_embeds,
-                input_frames=input_frames,
-                input_masks=input_mask,
-                ref_images=ref_images,
-                width=width,
-                height=height,
-                num_frames=num_frames,
-                shift=shift,
-                scheduler_name=scheduler,
-                steps=steps,
-                cfg=cfg,
-                seed=seed,
-                sigmas=sigmas,
-                device=device,
-                offload_device=offload_device,
-                force_offload=force_offload
-            )
-            
+        
         if enable_benchmarking:
             report = self.generate_benchmark_report()
             print("\n" + report)
