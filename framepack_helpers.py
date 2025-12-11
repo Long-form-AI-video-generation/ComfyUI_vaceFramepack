@@ -746,3 +746,291 @@ class ReferenceImageProcessor:
         ref_images = ref_images * 2 - 1
         
         return ref_images
+
+
+class FramePackManager:
+    """
+    Manages FramePack compression logic, scheduling, and RoPE generation.
+    Implements 'Dense Compression' strategy.
+    """
+    
+    # Compression schedule configuration
+    # Format: (distance_start, distance_end, compression_factor)
+    # Distance is from the start of the generation window backwards
+    SCHEDULE_CONFIG = [
+        (0, 5, 1),      # Recent: Full resolution (1x2x2 effective)
+        (5, 20, 4),     # Mid-term: 4x compression (1x4x4 effective)
+        (20, 50, 16),   # Long-term: 16x compression (2x8x8 effective)
+        (50, float('inf'), 64) # Deep history: 64x compression (4x16x16 effective)
+    ]
+    
+    # Base patch size of the model (t, h, w)
+    BASE_PATCH_SIZE = (1, 2, 2)
+    
+    @staticmethod
+    def calculate_schedule(total_frames, current_window_start):
+        """
+        Calculate compression schedule for history frames.
+        Returns a list of segments with their compression factors.
+        """
+        segments = []
+        
+        # We look backwards from current_window_start
+        # Frame indices: 0 ... current_window_start-1
+        
+        if current_window_start <= 0:
+            return []
+            
+        # Iterate through history frames
+        # We'll group consecutive frames with the same compression factor
+        
+        current_segment = None
+        
+        for i in range(current_window_start):
+            # Distance from the *start* of the generation window
+            # i.e., frame (current_window_start - 1) has distance 1
+            distance = current_window_start - i
+            
+            compression = 1
+            for start, end, factor in FramePackManager.SCHEDULE_CONFIG:
+                if start < distance <= end:
+                    compression = factor
+                    break
+            
+            if current_segment is None:
+                current_segment = {
+                    'start': i,
+                    'end': i + 1,
+                    'compression': compression
+                }
+            elif current_segment['compression'] == compression:
+                current_segment['end'] = i + 1
+            else:
+                segments.append(current_segment)
+                current_segment = {
+                    'start': i,
+                    'end': i + 1,
+                    'compression': compression
+                }
+        
+        if current_segment:
+            segments.append(current_segment)
+            
+        return segments
+
+    @staticmethod
+    def pool_latents(latents, schedule, device):
+        """
+        Pool history latents based on the schedule.
+        Input: latents tensor [B, C, T, H, W] (concatenated history)
+        Output: List of compressed latent tensors
+        """
+        compressed_chunks = []
+        
+        # latents is expected to be the full history tensor
+        # We need to slice it according to the schedule
+        # Note: The schedule indices refer to *frames*, but latents are *latent frames*.
+        # WanVideo VAE stride is (4, 8, 8).
+        # So 1 latent frame = 4 pixel frames.
+        # We need to map pixel frame indices to latent indices.
+        
+        # Actually, the input 'latents' here should probably be the *latent* representation of history.
+        # If we are working with already encoded latents, we need to adjust the schedule logic 
+        # or assume the schedule applies to latent frames directly.
+        
+        # Let's assume the schedule applies to *latent frames* for simplicity in this V1.
+        # Or better, we pass the pixel-space schedule and convert.
+        
+        # VAE Stride T=4.
+        vae_stride_t = 4
+        
+        for segment in schedule:
+            # Convert pixel indices to latent indices
+            # We take a conservative approach: include latent frames that cover the pixel range
+            start_idx = segment['start'] // vae_stride_t
+            end_idx = (segment['end'] + vae_stride_t - 1) // vae_stride_t
+            
+            # Ensure we don't go out of bounds
+            if start_idx >= latents.shape[2]:
+                continue
+            end_idx = min(end_idx, latents.shape[2])
+            
+            if start_idx >= end_idx:
+                continue
+                
+            chunk = latents[:, :, start_idx:end_idx, :, :]
+            factor = segment['compression']
+            
+            if factor == 1:
+                compressed_chunks.append(chunk)
+            else:
+                # Calculate pooling kernel
+                # Factor 4 -> 1x2x2 pooling on latents (since latents are already 4x8x8 pixels)
+                # Plan: "Mid-Term (4x): 1x4x4 effective". Base is 1x2x2.
+                # So we need 1x2x2 pooling on the *patch embeddings*, not VAE latents.
+                # The VAE latents are input to the model.
+                # The model patches them.
+                # So this function should be called inside the model forward pass, on the *embeddings*.
+                
+                
+                # REVISION: This function will be used inside WanModel to pool *embeddings*.
+                # So input 'latents' is actually 'embeddings' [B, C, T, H, W] (after patch_embedding).
+                
+                # Calculate kernel size for embedding pooling
+                # Base patch: 1x2x2.
+                # Target 4x compression -> Need to reduce token count by 4.
+                # We can do 1x2x2 pooling on embeddings. (1*2*2 = 4).
+                # Target 16x compression -> Need to reduce by 16.
+                # We can do 2x2x4 pooling? Or 1x4x4?
+                # 1x4x4 = 16.
+                # Target 64x compression -> Need to reduce by 64.
+                # 4x4x4 = 64.
+                
+                # Let's define kernel sizes for factors:
+                if factor == 4:
+                    kernel = (1, 2, 2)
+                elif factor == 16:
+                    kernel = (1, 4, 4)
+                elif factor == 64:
+                    kernel = (4, 4, 4)
+                else:
+                    kernel = (1, 1, 1)
+                
+                # Handle dimensions that might not be divisible
+                # We use ceil_mode=True logic or padding if needed, but avg_pool3d handles boundaries reasonably.
+                pooled = F.avg_pool3d(chunk, kernel_size=kernel, stride=kernel, ceil_mode=True)
+                compressed_chunks.append(pooled)
+                
+        return compressed_chunks
+
+    @staticmethod
+    def compute_freqs_from_positions(positions, dim, theta=10000):
+        """
+        Generate RoPE frequencies for arbitrary 1D positions.
+        Replicates logic from rope_params but for explicit positions.
+        """
+        # positions: [N]
+        # dim: embedding dimension
+        
+        assert dim % 2 == 0
+        # exponents = torch.arange(0, dim, 2, dtype=torch.float64).div(dim)
+        # inv_theta_pow = 1.0 / torch.pow(theta, exponents)
+        
+        # Use the same logic as WanVideo rope_params
+        exponents = torch.arange(0, dim, 2, dtype=torch.float64, device=positions.device).div(dim)
+        inv_theta_pow = 1.0 / torch.pow(theta, exponents)
+        
+        freqs = torch.outer(positions.to(dtype=torch.float64), inv_theta_pow)
+        freqs = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs
+
+    @staticmethod
+    def generate_compressed_freqs(schedule, dim, original_grid_size, device):
+        """
+        Generate the full frequency tensor for the compressed history.
+        original_grid_size: (F, H, W) of the *embeddings* (before pooling)
+        """
+        # We need to generate T, H, W frequencies separately and then combine them
+        # just like rope_apply does, but for the compressed sequence.
+        
+        # 1. Construct the list of (t, h, w) coordinates for every token in the compressed sequence.
+        
+        t_freqs_list = []
+        h_freqs_list = []
+        w_freqs_list = []
+        
+        # We assume the schedule segments map to the embedding grid
+        # original_grid_size is [F_emb, H_emb, W_emb]
+        
+        current_t = 0
+        
+        all_freqs = []
+        
+        for segment in schedule:
+            factor = segment['compression']
+            
+            # Determine kernel size (must match pool_latents)
+            if factor == 4:
+                k_t, k_h, k_w = 1, 2, 2
+            elif factor == 16:
+                k_t, k_h, k_w = 1, 4, 4
+            elif factor == 64:
+                k_t, k_h, k_w = 4, 4, 4
+            else:
+                k_t, k_h, k_w = 1, 1, 1
+            
+            # Segment length in embedding frames
+            # We need to know how many frames this segment covers in embedding space
+            # The schedule is in *latent frames* (from calculate_schedule logic above)
+            # But here we are working with *embedding frames*.
+            # WanVideo: Patch Size (1, 2, 2).
+            # So 1 Latent Frame = 1 Embedding Frame (Temporal patch size is 1).
+            # So schedule 'start'/'end' map 1:1 to embedding temporal dimension.
+            
+            seg_start = segment['start']
+            seg_end = segment['end']
+            seg_len = seg_end - seg_start
+            
+            # Generate T coordinates (centroids)
+            # If we pool 4 frames [0,1,2,3], centroid is 1.5
+            # Local coords: linspace(start + (k-1)/2, end - (k-1)/2, steps)
+            
+            num_t = math.ceil(seg_len / k_t)
+            t_coords = torch.linspace(
+                seg_start + (k_t - 1) / 2,
+                seg_end - 1 - (k_t - 1) / 2, # Approximate end
+                num_t,
+                device=device
+            )
+            
+            # Generate H, W coordinates
+            # H, W are spatial dimensions of the embeddings
+            H_emb, W_emb = original_grid_size[1], original_grid_size[2]
+            
+            num_h = math.ceil(H_emb / k_h)
+            h_coords = torch.linspace((k_h - 1) / 2, H_emb - 1 - (k_h - 1) / 2, num_h, device=device)
+            
+            num_w = math.ceil(W_emb / k_w)
+            w_coords = torch.linspace((k_w - 1) / 2, W_emb - 1 - (k_w - 1) / 2, num_w, device=device)
+            
+            # Now we need to compute the RoPE frequencies for these coordinates
+            # WanVideo splits dim into 3 parts: [d0, d1, d2] for T, H, W
+            # d = dim // num_heads
+            # parts = [d - 4*(d//6), 2*(d//6), 2*(d//6)]
+            
+            # We need the exact split logic from WanModel
+            # dim passed here is usually head_dim
+            
+            d = dim
+            d_t = d - 4 * (d // 6)
+            d_h = 2 * (d // 6)
+            d_w = 2 * (d // 6)
+            
+            freqs_t = FramePackManager.compute_freqs_from_positions(t_coords, d_t)
+            freqs_h = FramePackManager.compute_freqs_from_positions(h_coords, d_h)
+            freqs_w = FramePackManager.compute_freqs_from_positions(w_coords, d_w)
+            
+            # Now we need to broadcast and combine them into a grid for this segment
+            # Shape: [num_t, num_h, num_w, dim]
+            
+            # freqs_t: [num_t, d_t/2] (complex)
+            # We need to expand to [num_t, num_h, num_w, d_t/2]
+            
+            ft = freqs_t.view(num_t, 1, 1, -1).expand(num_t, num_h, num_w, -1)
+            fh = freqs_h.view(1, num_h, 1, -1).expand(num_t, num_h, num_w, -1)
+            fw = freqs_w.view(1, 1, num_w, -1).expand(num_t, num_h, num_w, -1)
+            
+            # Concatenate along last dim
+            # Result: [num_t, num_h, num_w, dim/2]
+            f_combined = torch.cat([ft, fh, fw], dim=-1)
+            
+            # Flatten to [L_segment, dim/2]
+            f_flat = f_combined.reshape(-1, dim // 2)
+            all_freqs.append(f_flat)
+            
+        # Concatenate all segments
+        if not all_freqs:
+            return None
+            
+        full_freqs = torch.cat(all_freqs, dim=0)
+        return full_freqs

@@ -382,7 +382,7 @@ class WanVACEVideoFramepackSampler2:
             gc.collect()
         
         final_latent = torch.cat(all_generated_latents, dim=1)
-        return final_latent.cpu()
+        return final_latent.cpu().float()
 
     def _predict_with_cfg(self, latent, cfg_scale, text_embeds, timestep, idx,
                          model_wrapper, vace_data, seq_len, freqs, device):
