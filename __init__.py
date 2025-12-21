@@ -46,6 +46,7 @@ class WanVACEVideoFramepackSampler2:
                     "multiline": True
                 }),
                 "encode_prompts": ("BOOLEAN", {"default": True}),
+                "tiled_vae": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "sigmas": ("SIGMAS",),
@@ -75,7 +76,7 @@ class WanVACEVideoFramepackSampler2:
 
     def process(self, model, vae, steps, cfg, shift, seed, scheduler,
                 num_frames, width, height, force_offload, multi_prompts,
-                encode_prompts=True, ref_images=None, input_frames=None, 
+                encode_prompts=True, tiled_vae=True, ref_images=None, input_frames=None, 
                 input_mask=None, negative_prompt="", sigmas=None, 
                 text_embeds_list=None, wan_t5_model=None):
         """Main processing function for ComfyUI with multi-prompt support"""
@@ -107,7 +108,8 @@ class WanVACEVideoFramepackSampler2:
         model_wrapper = model_obj.diffusion_model
         
         # Setup VAE
-        self.vae_processor = VAEProcessor(vae.to(device).to(torch.float32), device)
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        self.vae_processor = VAEProcessor(vae.to(device).to(dtype), device)
         model_wrapper.to(device)
         
         # Ensure dimensions are multiples of 16
@@ -158,7 +160,8 @@ class WanVACEVideoFramepackSampler2:
             sigmas=sigmas,
             device=device,
             offload_device=offload_device,
-            force_offload=force_offload
+            force_offload=force_offload,
+            tiled_vae=tiled_vae
         )
         
         # Generate and save benchmark report
@@ -173,10 +176,10 @@ class WanVACEVideoFramepackSampler2:
                                        section_prompts, input_frames, input_masks, 
                                        ref_images, width, height, num_frames,
                                        shift, scheduler_name, steps, cfg, seed, sigmas,
-                                       device, offload_device, force_offload):
+                                       device, offload_device, force_offload, tiled_vae=True):
         """Core FramePack generation algorithm with multi-prompt support"""
         
-        vae_dtype = torch.float32
+        vae_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         all_generated_latents = []
         accumulated_latents = []
         total_output_frames = 0
@@ -221,7 +224,32 @@ class WanVACEVideoFramepackSampler2:
                 context_latent = ContextBuilder.build_hierarchical_context(accumulated_latents, section)
                 hierarchical_frames = ContextBuilder.pick_context(context_latent, section)
                 
+                print(f"Decoding context latent shape: {hierarchical_frames.shape}")
                 input_frames = self.vae_processor.decode_latent([hierarchical_frames], None)
+                print(f"Decoded frames shape: {input_frames[0].shape}")
+                
+                # Pad in pixel space to reach 161 frames (41 latent frames)
+                # 11 latent frames -> 41 pixel frames
+                # We need 161 pixel frames total
+                # So we pad 120 frames
+                decoded_frames = input_frames[0]
+                C, T, H, W = decoded_frames.shape
+                
+                # Calculate required padding
+                # Target latent frames = 41
+                # Target pixel frames = (41 - 1) * 4 + 1 = 161
+                TARGET_PIXEL_FRAMES = 161
+                padding_needed = TARGET_PIXEL_FRAMES - T
+                
+                if padding_needed > 0:
+                    print(f"Padding {padding_needed} frames in pixel space")
+                    # Pad with zeros (black)
+                    padding = torch.zeros((C, padding_needed, H, W), device=decoded_frames.device, dtype=decoded_frames.dtype)
+                    # Or pad with -1 (if range is -1 to 1)
+                    padding = padding - 1.0 
+                    
+                    input_frames[0] = torch.cat([decoded_frames, padding], dim=1)
+                
                 input_frames[0] = input_frames[0].expand(3, -1, -1, -1)
                 
                 input_masks = MaskGenerator.create_temporal_blend_mask(
@@ -239,7 +267,7 @@ class WanVACEVideoFramepackSampler2:
             
             # Encode to latent space
             z0 = self.vae_processor.encode_frames(input_frames, ref_images=ref_images, 
-                                                 masks=input_masks, tiled_vae=False)
+                                                 masks=input_masks, tiled_vae=tiled_vae)
             m0 = self.vae_processor.encode_masks(input_masks, ref_images=ref_images)
             z = self.vae_processor.combine_latent(z0, m0)
             
@@ -264,7 +292,7 @@ class WanVACEVideoFramepackSampler2:
                 target_shape[1] + (1 if has_ref else 0),
                 target_shape[2],
                 target_shape[3],
-                dtype=torch.float32,
+                dtype=vae_dtype,
                 device="cpu",
                 generator=generator
             )
@@ -388,7 +416,12 @@ class WanVACEVideoFramepackSampler2:
                          model_wrapper, vace_data, seq_len, freqs, device):
         """Classifier-free guidance prediction"""
         
-        dtype = torch.float32
+        # Use bfloat16 if available, otherwise float16 for better performance
+        try:
+            dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        except:
+            dtype = torch.float16
+            
         latent = latent.to(dtype)
         
         with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype):

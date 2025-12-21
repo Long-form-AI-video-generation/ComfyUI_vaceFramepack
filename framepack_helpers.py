@@ -439,6 +439,15 @@ class VAEProcessor:
     
     def encode_frames(self, frames, ref_images, masks=None, tiled_vae=False):
         """Encode frames to latent space"""
+        print(f"VAE Encoding debug:")
+        print(f"  Input frames type: {type(frames)}")
+        if isinstance(frames, list):
+             print(f"  Input frames list len: {len(frames)}")
+             if len(frames) > 0:
+                 print(f"  Frame 0 shape: {frames[0].shape}")
+        elif isinstance(frames, torch.Tensor):
+             print(f"  Input frames shape: {frames.shape}")
+             
         if ref_images is None:
             ref_images = [None] * len(frames)
         else:
@@ -552,63 +561,26 @@ class ContextBuilder:
             padding = torch.zeros((C, padding_needed, H, W), device=frames.device)
             return torch.cat([frames, padding], dim=1)
 
-        selected_indices = []
-
-        # Long-term context
-        if T >= 40:
-            step = max(4, T // 20)
-            long_indices = []
-            for i in range(LONG_FRAMES):
-                idx = min(i * step, T - 15)
-                long_indices.append(idx)
-            selected_indices.extend(long_indices)
+        # SIMPLIFIED STRATEGY: Use the last 11 frames contiguously
+        CONTEXT_FRAMES = LONG_FRAMES + MID_FRAMES + RECENT_FRAMES + OVERLAP_FRAMES # 11
+        
+        # Ensure we have enough frames
+        if T < CONTEXT_FRAMES:
+             # Fallback if not enough frames (unlikely after section 0)
+             context_frames = frames
+             padding = torch.zeros((C, CONTEXT_FRAMES - T, H, W), device=frames.device)
+             context_frames = torch.cat([padding, context_frames], dim=1)
         else:
-            if T >= LONG_FRAMES:
-                step = T // LONG_FRAMES
-                long_indices = [i * step for i in range(LONG_FRAMES)]
-            else:
-                long_indices = list(range(T))
-                while len(long_indices) < LONG_FRAMES:
-                    long_indices.append(T - 1)
-            selected_indices.extend(long_indices[:LONG_FRAMES])
+             context_frames = frames[:, -CONTEXT_FRAMES:, :, :]
 
-        # Mid-term context
-        mid_start = max(LONG_FRAMES, T - 15)
-        mid_indices = [
-            min(mid_start, T - 1),
-            min(mid_start + 2, T - 1)
-        ]
-        selected_indices.extend(mid_indices)
+        # Return ONLY the context frames, do not pad with placeholder yet
+        # We will handle padding in pixel space after decoding
+        final_frames = context_frames
 
-        # Recent context
-        recent_idx = max(0, T - 5)
-        selected_indices.append(recent_idx)
-
-        # Overlap frames
-        overlap_start = max(0, T - OVERLAP_FRAMES)
-        overlap_indices = list(range(overlap_start, T))
-        while len(overlap_indices) < OVERLAP_FRAMES:
-            overlap_indices.append(T - 1)
-        selected_indices.extend(overlap_indices[:OVERLAP_FRAMES])
-
-        context_frames = frames[:, selected_indices, :, :]
-        gen_placeholder = torch.zeros((C, GEN_FRAMES, H, W), device=frames.device)
-
-        final_frames = torch.cat([
-            context_frames[:, :LONG_FRAMES],
-            context_frames[:, LONG_FRAMES:LONG_FRAMES+MID_FRAMES],
-            context_frames[:, LONG_FRAMES+MID_FRAMES:LONG_FRAMES+MID_FRAMES+RECENT_FRAMES],
-            context_frames[:, -OVERLAP_FRAMES:],
-            gen_placeholder
-        ], dim=1)
-
-        assert final_frames.shape[1] == TOTAL_FRAMES, \
-            f"Expected {TOTAL_FRAMES} frames, got {final_frames.shape[1]}"
-
-        if section_id % 5 == 0:
+        if section_id % 5 == 0 or True: # Always print for now
             print(f"\nContext selection debug (section {section_id}):")
             print(f"  Input frames: {T}")
-            print(f"  Selected indices: {selected_indices}")
+            print(f"  Strategy: Contiguous last {CONTEXT_FRAMES} frames")
             print(f"  Output shape: {final_frames.shape}")
 
         return final_frames
@@ -635,6 +607,11 @@ class MaskGenerator:
         RECENT_FRAMES = int(1 * expansion_ratio)
         OVERLAP_FRAMES = int(2 * expansion_ratio)
         GEN_FRAMES = decoded_frames - (LONG_FRAMES + MID_FRAMES + RECENT_FRAMES + OVERLAP_FRAMES)
+        
+        print(f"\nMask generation debug (section {section_id}):")
+        print(f"  Decoded frames: {decoded_frames}")
+        print(f"  Expansion ratio: {expansion_ratio}")
+        print(f"  Segments: L={LONG_FRAMES}, M={MID_FRAMES}, R={RECENT_FRAMES}, O={OVERLAP_FRAMES}, Gen={GEN_FRAMES}")
         
         if initial:
             mask[:, :-GEN_FRAMES] = 0.0
