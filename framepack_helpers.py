@@ -472,7 +472,7 @@ class VAEProcessor:
                 else:
                     ref_latent = self.vae.encode(refs, device=self.device, tiled=tiled_vae)
                     ref_latent = [torch.cat((u, torch.zeros_like(u)), dim=0) for u in ref_latent]
-                assert all([x.shape[1] == 1 for x in ref_latent])
+
                 latent = torch.cat([*ref_latent, latent], dim=1)
             cat_latents.append(latent)
         
@@ -506,8 +506,17 @@ class VAEProcessor:
             mask = F.interpolate(mask.unsqueeze(0), size=(new_depth, height, width), mode='nearest-exact').squeeze(0)
 
             if refs is not None:
-                length = len(refs)
-                mask_pad = torch.zeros_like(mask[:, :length, :, :])
+                # Calculate latent temporal dimension for reference images
+                # refs shape is [1, C, T, H, W]
+                pixel_frames = refs.shape[2]
+                latent_ref_length = (pixel_frames - 1) // VAE_STRIDE[0] + 1
+                
+                # Create zero mask for reference frames
+                mask_pad = torch.zeros(
+                    (mask.shape[0], latent_ref_length, mask.shape[2], mask.shape[3]),
+                    device=mask.device,
+                    dtype=mask.dtype
+                )
                 mask = torch.cat((mask_pad, mask), dim=1)
             result_masks.append(mask)
         
@@ -544,12 +553,12 @@ class ContextBuilder:
         Enhanced hierarchical context selection with constant 41-frame output.
         """
         # Constants
-        LONG_FRAMES = 5
-        MID_FRAMES = 3
-        RECENT_FRAMES = 1
-        OVERLAP_FRAMES = 2
+        LONG_FRAMES = 14
+        MID_FRAMES = 8
+        RECENT_FRAMES = 3
+        OVERLAP_FRAMES = 5
         GEN_FRAMES = 30
-        TOTAL_FRAMES = 41
+        TOTAL_FRAMES = 60
 
         C, T, H, W = frames.shape
 
@@ -595,17 +604,17 @@ class MaskGenerator:
         C, T, H, W = frame_shape
         
         # Constants
-        LATENT_FRAMES = 41
+        LATENT_FRAMES = 60
         decoded_frames = T
         expansion_ratio = decoded_frames / LATENT_FRAMES
         
         mask = torch.zeros(3, decoded_frames, H, W, device=device)
         
         # Scale all frame counts by the expansion ratio
-        LONG_FRAMES = int(5 * expansion_ratio)
-        MID_FRAMES = int(3 * expansion_ratio)
-        RECENT_FRAMES = int(1 * expansion_ratio)
-        OVERLAP_FRAMES = int(2 * expansion_ratio)
+        LONG_FRAMES = int(14 * expansion_ratio)
+        MID_FRAMES = int(8 * expansion_ratio)
+        RECENT_FRAMES = int(3 * expansion_ratio)
+        OVERLAP_FRAMES = int(5 * expansion_ratio)
         GEN_FRAMES = decoded_frames - (LONG_FRAMES + MID_FRAMES + RECENT_FRAMES + OVERLAP_FRAMES)
         
         print(f"\nMask generation debug (section {section_id}):")
@@ -691,12 +700,14 @@ class ReferenceImageProcessor:
     """Handles reference image processing"""
     
     @staticmethod
-    def process_reference_images(ref_images, width, height, device, dtype):
+    def process_reference_images(ref_images, width, height, device, dtype, target_ref_count=1):
         """Process reference images for generation"""
-        if ref_images.shape[0] > 1:
-            ref_images = torch.cat([ref_images[i] for i in range(ref_images.shape[0])], 
-                                dim=1).unsqueeze(0)
-    
+        
+        # Handle duplication if requested
+        if ref_images.shape[0] == 1 and target_ref_count > 1:
+            print(f"Duplicating single reference image {target_ref_count} times")
+            ref_images = ref_images.repeat(target_ref_count, 1, 1, 1)
+
         B, H, W, C = ref_images.shape
         current_aspect = W / H
         target_aspect = width / height
@@ -717,9 +728,8 @@ class ReferenceImageProcessor:
             ref_images = padded
             
         ref_images = common_upscale(ref_images.movedim(-1, 1), width, height, 
-                                "lanczos", "center").movedim(1, -1)
-        ref_images = ref_images.to(dtype).to(device).unsqueeze(0)
-        ref_images = ref_images.permute(0, 4, 1, 2, 3).unsqueeze(0)
-        ref_images = ref_images * 2 - 1
+                                "lanczos", "center")
+        ref_images = ref_images.movedim(0, 1) # [C, T, H, W]
+        ref_images = (ref_images.to(dtype).to(device) * 2 - 1)
         
-        return ref_images
+        return [ref_images.unsqueeze(0)] # [1, C, T, H, W]

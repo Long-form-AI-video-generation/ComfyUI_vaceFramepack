@@ -37,9 +37,10 @@ class WanVACEVideoFramepackSampler2:
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "scheduler": (["dpm++", "unipc", "euler", "deis", "lcm"], {"default": "unipc"}),
-                "num_frames": ("INT", {"default": 81, "min": 41, "max": 1000, "step": 1}),
+                "num_frames": ("INT", {"default": 121, "min": 41, "max": 1000, "step": 1}),
                 "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8}),
                 "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 8}),
+                "n_ref_frames": ("INT", {"default": 1, "min": 1, "max": 121, "step": 1}),
                 "force_offload": ("BOOLEAN", {"default": True}),
                 "multi_prompts": ("STRING", {
                     "default": "A person walking in a park\nThe person starts jogging\nThe person runs faster\nThe person slows down to rest", 
@@ -75,7 +76,7 @@ class WanVACEVideoFramepackSampler2:
         torch.backends.cudnn.allow_tf32 = True
 
     def process(self, model, vae, steps, cfg, shift, seed, scheduler,
-                num_frames, width, height, force_offload, multi_prompts,
+                num_frames, width, height, n_ref_frames, force_offload, multi_prompts,
                 encode_prompts=True, tiled_vae=True, ref_images=None, input_frames=None, 
                 input_mask=None, negative_prompt="", sigmas=None, 
                 text_embeds_list=None, wan_t5_model=None):
@@ -117,7 +118,7 @@ class WanVACEVideoFramepackSampler2:
         height = (height // 16) * 16
         
         # Calculate number of sections
-        INITIAL_FRAMES = 81
+        INITIAL_FRAMES = 121
         num_sections = 1 if num_frames <= INITIAL_FRAMES else math.ceil(num_frames / INITIAL_FRAMES)
         
         # Parse prompts
@@ -161,7 +162,8 @@ class WanVACEVideoFramepackSampler2:
             device=device,
             offload_device=offload_device,
             force_offload=force_offload,
-            tiled_vae=tiled_vae
+            tiled_vae=tiled_vae,
+            n_ref_frames=n_ref_frames
         )
         
         # Generate and save benchmark report
@@ -176,7 +178,8 @@ class WanVACEVideoFramepackSampler2:
                                        section_prompts, input_frames, input_masks, 
                                        ref_images, width, height, num_frames,
                                        shift, scheduler_name, steps, cfg, seed, sigmas,
-                                       device, offload_device, force_offload, tiled_vae=True):
+                                       device, offload_device, force_offload, tiled_vae=True,
+                                       n_ref_frames=1):
         """Core FramePack generation algorithm with multi-prompt support"""
         
         vae_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
@@ -184,10 +187,10 @@ class WanVACEVideoFramepackSampler2:
         accumulated_latents = []
         total_output_frames = 0
 
-        LATENT_WINDOW = 41
+        LATENT_WINDOW = 60
         GENERATION_FRAMES = 30
-        CONTEXT_FRAMES = 11
-        INITIAL_FRAMES = 81
+        CONTEXT_FRAMES = 30
+        INITIAL_FRAMES = 121
         
         num_sections = 1 if num_frames <= INITIAL_FRAMES else math.ceil(num_frames / INITIAL_FRAMES)
         
@@ -210,7 +213,7 @@ class WanVACEVideoFramepackSampler2:
                 # Process reference images if provided
                 if ref_images is not None:
                     ref_images = ReferenceImageProcessor.process_reference_images(
-                        ref_images, width, height, device, vae_dtype
+                        ref_images, width, height, device, vae_dtype, n_ref_frames
                     )
                 
                 target_shape = (
@@ -220,6 +223,10 @@ class WanVACEVideoFramepackSampler2:
                     width // VAE_STRIDE[2]
                 )
             else:
+                # Clear memory before intensive context scaling
+                mm.soft_empty_cache()
+                gc.collect()
+                
                 # Build context from previous sections
                 context_latent = ContextBuilder.build_hierarchical_context(accumulated_latents, section)
                 hierarchical_frames = ContextBuilder.pick_context(context_latent, section)
@@ -238,7 +245,7 @@ class WanVACEVideoFramepackSampler2:
                 # Calculate required padding
                 # Target latent frames = 41
                 # Target pixel frames = (41 - 1) * 4 + 1 = 161
-                TARGET_PIXEL_FRAMES = 161
+                TARGET_PIXEL_FRAMES = 237
                 padding_needed = TARGET_PIXEL_FRAMES - T
                 
                 if padding_needed > 0:
@@ -288,10 +295,10 @@ class WanVACEVideoFramepackSampler2:
             
             has_ref = ref_images is not None
             noise = torch.randn(
-                target_shape[0],
-                target_shape[1] + (1 if has_ref else 0),
-                target_shape[2],
-                target_shape[3],
+                16, # Always 16 channels for Wan Video model
+                z[0].shape[1],
+                z[0].shape[2],
+                z[0].shape[3],
                 dtype=vae_dtype,
                 device="cpu",
                 generator=generator
@@ -370,8 +377,10 @@ class WanVACEVideoFramepackSampler2:
             
             # Handle accumulation based on section
             if section == 0:
-                if ref_images is not None:
-                    latent_without_ref = latent[:, 1:, :, :]
+                # Dynamically calculate reference length (noise frames - generation frames)
+                ref_len = latent.shape[1] - target_shape[1]
+                if ref_len > 0:
+                    latent_without_ref = latent[:, ref_len:, :, :]
                 else:
                     latent_without_ref = latent
                 
@@ -382,13 +391,11 @@ class WanVACEVideoFramepackSampler2:
                 if section > 2:
                     accumulated_latents.pop(0)
                 
-                # Add new frames
-                new = latent[:, -GENERATION_FRAMES:, :, :]
-                accumulated_latents.append(new)
-                
                 # Add to final output (skip overlap frames)
-                new_content = latent[:, -GENERATION_FRAMES:, :, :]
-                new_content = new_content[:, CONTEXT_FRAMES:, :, :]
+                # The first CONTEXT_FRAMES are from previous section, 
+                # the rest are the new generation.
+                new_content = latent[:, CONTEXT_FRAMES:, :, :]
+                accumulated_latents.append(new_content)
                 all_generated_latents.append(new_content)
                 
                 frames_added = new_content.shape[1]
