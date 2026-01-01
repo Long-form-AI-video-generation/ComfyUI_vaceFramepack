@@ -17,15 +17,18 @@ from .framepack_helpers import (
     MaskGenerator,
     FrequencyProcessor,
     ReferenceImageProcessor,
-    VAE_STRIDE
+    VAE_STRIDE,
+    SparseSelector,
+    MoCRouter,
+    FramePackCompressor
 )
 import time
 from diffusers.schedulers import DEISMultistepScheduler
 from .wanvideo.utils.basic_flowmatch import FlowMatchScheduler
 
 
-
 class WanVACEVideoFramepackSampler2:
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -42,6 +45,10 @@ class WanVACEVideoFramepackSampler2:
                 "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 8}),
                 "n_ref_frames": ("INT", {"default": 1, "min": 1, "max": 121, "step": 1}),
                 "force_offload": ("BOOLEAN", {"default": True}),
+                "context_method": (["contiguous", "sparse", "moc", "frame"], {"default": "contiguous"}),
+                "num_context_chunks": ("INT", {"default": 5, "min": 1, "max": 20}),
+                "lambda_compression": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
+                "top_k_chunks": ("INT", {"default": 3, "min": 1, "max": 30}),
                 "multi_prompts": ("STRING", {
                     "default": "A person walking in a park\nThe person starts jogging\nThe person runs faster\nThe person slows down to rest", 
                     "multiline": True
@@ -67,6 +74,9 @@ class WanVACEVideoFramepackSampler2:
     DESCRIPTION = "A sampler specifically for the FramePack algorithm for long video generation using hierarchical context."
 
     def __init__(self):
+        self.vae_processor = None
+        self.frame_compressor = None
+        self.device = None
         self.cache_state = None
         self.benchmark_manager = BenchmarkManager()
         
@@ -76,10 +86,11 @@ class WanVACEVideoFramepackSampler2:
         torch.backends.cudnn.allow_tf32 = True
 
     def process(self, model, vae, steps, cfg, shift, seed, scheduler,
-                num_frames, width, height, n_ref_frames, force_offload, multi_prompts,
-                encode_prompts=True, tiled_vae=True, ref_images=None, input_frames=None, 
-                input_mask=None, negative_prompt="", sigmas=None, 
-                text_embeds_list=None, wan_t5_model=None):
+                num_frames, width, height, n_ref_frames, force_offload, 
+                context_method, num_context_chunks, lambda_compression, top_k_chunks,
+                multi_prompts, encode_prompts=True, tiled_vae=True, ref_images=None, 
+                input_frames=None, input_mask=None, negative_prompt="", 
+                sigmas=None, text_embeds_list=None, wan_t5_model=None):
         """Main processing function for ComfyUI with multi-prompt support"""
         
         enable_benchmarking = True
@@ -108,9 +119,10 @@ class WanVACEVideoFramepackSampler2:
         model_obj = model.model
         model_wrapper = model_obj.diffusion_model
         
-        # Setup VAE
+        # Setup VAE and Helper
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         self.vae_processor = VAEProcessor(vae.to(device).to(dtype), device)
+        self.frame_compressor = FramePackCompressor(lambda_compression=lambda_compression)
         model_wrapper.to(device)
         
         # Ensure dimensions are multiples of 16
@@ -155,6 +167,10 @@ class WanVACEVideoFramepackSampler2:
             num_frames=num_frames,
             shift=shift,
             scheduler_name=scheduler,
+            context_method=context_method,
+            num_context_chunks=num_context_chunks,
+            lambda_compression=lambda_compression,
+            top_k_chunks=top_k_chunks,
             steps=steps,
             cfg=cfg,
             seed=seed,
@@ -177,7 +193,10 @@ class WanVACEVideoFramepackSampler2:
     def _generate_with_framepack_multi(self, model_wrapper, section_text_embeds, 
                                        section_prompts, input_frames, input_masks, 
                                        ref_images, width, height, num_frames,
-                                       shift, scheduler_name, steps, cfg, seed, sigmas,
+                                       shift, scheduler_name, 
+                                       context_method, num_context_chunks, 
+                                       lambda_compression, top_k_chunks,
+                                       steps, cfg, seed, sigmas,
                                        device, offload_device, force_offload, tiled_vae=True,
                                        n_ref_frames=1):
         """Core FramePack generation algorithm with multi-prompt support"""
@@ -204,11 +223,11 @@ class WanVACEVideoFramepackSampler2:
             self.benchmark_manager.benchmark_section(section, 'encoding')
             
             if section == 0:
-                # Initial section setup
+                # Initial section setup (Section 0)
                 input_frames = torch.zeros(1, 3, INITIAL_FRAMES, height, width, 
                                           device=device, dtype=vae_dtype)
                 input_masks = torch.ones_like(input_frames, device=device, dtype=vae_dtype)
-                input_frames = [(f * 2 - 1) for f in input_frames]
+                input_frames = [(p * 2 - 1) for p in input_frames]
                 
                 # Process reference images if provided
                 if ref_images is not None:
@@ -216,6 +235,13 @@ class WanVACEVideoFramepackSampler2:
                         ref_images, width, height, device, vae_dtype, n_ref_frames
                     )
                 
+                # Encode to latent space (Only for Section 0)
+                z0 = self.vae_processor.encode_frames(input_frames, ref_images=ref_images, 
+                                                     masks=input_masks, tiled_vae=tiled_vae)
+                m0 = self.vae_processor.encode_masks(input_masks, ref_images=ref_images)
+                z = self.vae_processor.combine_latent(z0, m0)
+                
+                # Setup target shape for reference tracking
                 target_shape = (
                     16,
                     (INITIAL_FRAMES - 1) // VAE_STRIDE[0] + 1,
@@ -223,60 +249,47 @@ class WanVACEVideoFramepackSampler2:
                     width // VAE_STRIDE[2]
                 )
             else:
+                # Section > 0 setup (Latent Bypass)
                 # Clear memory before intensive context scaling
                 mm.soft_empty_cache()
                 gc.collect()
                 
-                # Build context from previous sections
-                context_latent = ContextBuilder.build_hierarchical_context(accumulated_latents, section)
-                hierarchical_frames = ContextBuilder.pick_context(context_latent, section)
+                # Context Management Branching
+                if context_method == "frame":
+                    print(f"Using Frame (Pseudo FramePack) context management")
+                    z_context = self.frame_compressor.prepare_context(accumulated_latents, section)
+                elif context_method == "sparse":
+                    print(f"Using Sparse (Anchor-Based) context management")
+                    z_context = SparseSelector.pick_sparse_context(accumulated_latents, CONTEXT_FRAMES)
+                elif context_method == "moc":
+                    print(f"Using MoC (Mixture of Contexts) context management")
+                    z_context = MoCRouter.retrieve_context(accumulated_latents, section_text_embeds[section], top_k=top_k_chunks)
+                else: # Default: Contiguous
+                    print(f"Using Contiguous context management")
+                    z_context = ContextBuilder.pick_context(torch.cat(accumulated_latents, dim=1), section)
+
+                print(f"Context latent shape: {z_context.shape}")
                 
-                print(f"Decoding context latent shape: {hierarchical_frames.shape}")
-                input_frames = self.vae_processor.decode_latent([hierarchical_frames], None)
-                print(f"Decoded frames shape: {input_frames[0].shape}")
+                # IMPORTANT: Latent-Space Optimization (No VAE round-trip)
+                # Reconstruct 96-channel VACE context structure:
+                # Inactive (16) + Reactive (16) + Mask (64) = 96 channels
                 
-                # Pad in pixel space to reach 161 frames (41 latent frames)
-                # 11 latent frames -> 41 pixel frames
-                # We need 161 pixel frames total
-                # So we pad 120 frames
-                decoded_frames = input_frames[0]
-                C, T, H, W = decoded_frames.shape
+                blend_val = 0.05 # Anchor strength
+                u = z_context * (1.0 - blend_val)
+                c = z_context * blend_val
                 
-                # Calculate required padding
-                # Target latent frames = 41
-                # Target pixel frames = (41 - 1) * 4 + 1 = 161
-                TARGET_PIXEL_FRAMES = 237
-                padding_needed = TARGET_PIXEL_FRAMES - T
+                # 64-channel encoded mask (spatial patches folded into channels)
+                # Since we use a uniform value, repetition is correct.
+                m_vace = torch.ones((64, z_context.shape[1], z_context.shape[2], z_context.shape[3]), 
+                                   device=device, dtype=vae_dtype) * blend_val
                 
-                if padding_needed > 0:
-                    print(f"Padding {padding_needed} frames in pixel space")
-                    # Pad with zeros (black)
-                    padding = torch.zeros((C, padding_needed, H, W), device=decoded_frames.device, dtype=decoded_frames.dtype)
-                    # Or pad with -1 (if range is -1 to 1)
-                    padding = padding - 1.0 
-                    
-                    input_frames[0] = torch.cat([decoded_frames, padding], dim=1)
+                z_bypass = torch.cat([u, c, m_vace], dim=0)
+                z = [z_bypass]
                 
-                input_frames[0] = input_frames[0].expand(3, -1, -1, -1)
+                print(f"Bypassing VAE for context. 96-ch Latent shape: {z[0].shape}")
                 
-                input_masks = MaskGenerator.create_temporal_blend_mask(
-                    input_frames[0].shape, section, device
-                )
+                # Update ref_images to None since we use latent context
                 ref_images = None
-                num_frames = input_frames[0].shape[1]
-                
-                target_shape = (
-                    16,
-                    (num_frames - 1) // VAE_STRIDE[0] + 1,
-                    height // VAE_STRIDE[1],
-                    width // VAE_STRIDE[2]
-                )
-            
-            # Encode to latent space
-            z0 = self.vae_processor.encode_frames(input_frames, ref_images=ref_images, 
-                                                 masks=input_masks, tiled_vae=tiled_vae)
-            m0 = self.vae_processor.encode_masks(input_masks, ref_images=ref_images)
-            z = self.vae_processor.combine_latent(z0, m0)
             
             self.benchmark_manager.benchmark_section(section, 'encoding')  # End encoding
             
@@ -391,10 +404,10 @@ class WanVACEVideoFramepackSampler2:
                 if section > 2:
                     accumulated_latents.pop(0)
                 
-                # Add to final output (skip overlap frames)
-                # The first CONTEXT_FRAMES are from previous section, 
-                # the rest are the new generation.
-                new_content = latent[:, CONTEXT_FRAMES:, :, :]
+                # Add to final output
+                # The latent returned by the model includes context + new generation
+                # We only want the new generation part
+                new_content = latent[:, -GENERATION_FRAMES:, :, :]
                 accumulated_latents.append(new_content)
                 all_generated_latents.append(new_content)
                 
