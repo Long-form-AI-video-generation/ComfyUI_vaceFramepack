@@ -20,7 +20,9 @@ from .framepack_helpers import (
     VAE_STRIDE,
     SparseSelector,
     MoCRouter,
-    FramePackCompressor
+    FramePackCompressor,
+    VideoMetrics,
+    BenchmarkAnalyzer
 )
 import time
 from diffusers.schedulers import DEISMultistepScheduler
@@ -210,6 +212,10 @@ class WanVACEVideoFramepackSampler2:
         GENERATION_FRAMES = 30
         CONTEXT_FRAMES = 30
         INITIAL_FRAMES = 121
+        
+        # Initialize analyzer
+        analyzer = BenchmarkAnalyzer()
+        reference_character_embed = None
         
         num_sections = 1 if num_frames <= INITIAL_FRAMES else math.ceil(num_frames / INITIAL_FRAMES)
         
@@ -415,6 +421,36 @@ class WanVACEVideoFramepackSampler2:
                 total_output_frames += frames_added
                 print(f"Added {frames_added} frames (total: {total_output_frames})")
             
+            # PHASE 4: EVALUATION (Optional)
+            try:
+                # Capture reference embedding from Section 0 Frame 0
+                if section == 0 and reference_character_embed is None:
+                    # Decode first frame [1, T, H, W] -> [1, 3, H, W]
+                    frame_ref = self.vae_processor.decode_single_frame(all_generated_latents[0], index=0)
+                    # Use model's CLIP encoder if available via model_wrapper
+                    # Since we are zero-shot, we can use the latent features as a proxy if CLIP is hard to reach
+                    reference_character_embed = all_generated_latents[0][:, 0, :, :].mean(dim=(1, 2))
+                    print("Captured reference character embedding for identity tracking.")
+
+                # Calculate boundary SSIM if section > 0
+                if section > 0:
+                    # Previous frame (last frame of previous section or context)
+                    # We use the decoded pixels for a proper SSIM
+                    frame_prev = self.vae_processor.decode_single_frame(all_generated_latents[-2], index=-1)
+                    frame_curr = self.vae_processor.decode_single_frame(all_generated_latents[-1], index=0)
+                    
+                    ssim_val = VideoMetrics.calculate_ssim_boundary(frame_prev, frame_curr)
+                    self.benchmark_manager.log_metric(section, "boundary_ssim", ssim_val)
+                    print(f"Boundary SSIM (Section {section-1} -> {section}): {ssim_val:.4f}")
+                    
+                    # Calculate identity drift
+                    current_embed = all_generated_latents[-1][:, 0, :, :].mean(dim=(1, 2))
+                    drift = VideoMetrics.calculate_embedding_drift(reference_character_embed, current_embed)
+                    self.benchmark_manager.log_metric(section, "identity_drift", drift)
+                    print(f"Identity Drift: {drift:.4f}")
+            except Exception as e:
+                print(f"Metrics calculation error: {e}")
+
             self.benchmark_manager.benchmark_section(section, 'accumulation')  # End accumulation
             
             # Clear cache after section
@@ -428,6 +464,11 @@ class WanVACEVideoFramepackSampler2:
             model_wrapper.to(offload_device)
             mm.soft_empty_cache()
             gc.collect()
+        
+        # Save benchmark data for this run
+        analyzer.save_run_data(context_method, self.benchmark_manager)
+        report_md = analyzer.generate_comparison_report()
+        print("\n" + report_md)
         
         final_latent = torch.cat(all_generated_latents, dim=1)
         return final_latent.cpu()

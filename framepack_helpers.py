@@ -125,6 +125,12 @@ class BenchmarkManager:
             
             cpu_delta = end_mem['cpu_memory_mb'] - start_mem['cpu_memory_mb']
             self.section_benchmarks[section_id][f"{phase_name}_cpu_memory_delta_mb"] = cpu_delta
+
+    def log_metric(self, section_id, metric_name, value):
+        """Log a custom quality metric for a section"""
+        if section_id not in self.section_benchmarks:
+            self.section_benchmarks[section_id] = {}
+        self.section_benchmarks[section_id][metric_name] = value
     
     def generate_report(self, section_prompts=None):
         """Generate a comprehensive benchmark report"""
@@ -530,6 +536,14 @@ class VAEProcessor:
     def decode_latent(self, zs, ref_images=None):
         """Decode latents back to frames"""
         return self.vae.decode(zs, device=self.device)
+
+    def decode_single_frame(self, latent, index=-1):
+        """Decode a specific frame index from a latent tensor [C, T, H, W]"""
+        # latent is usually [C, T, H, W]
+        # We need to wrap it for the VAE which expects [B, C, T, H, W] or list
+        # FramePack VAE expects a list of tensors
+        single_latent = latent[:, index:index+1, :, :].clone()
+        return self.vae.decode([single_latent], device=self.device)
 
 
 class ContextBuilder:
@@ -941,4 +955,139 @@ class MoCRouter:
         selected_chunks = [accumulated_latents[i] for i in selected_indices]
         return torch.cat(selected_chunks, dim=1)
 
- # [1, C, T, H, W]
+
+class VideoMetrics:
+    """Calculates quality and consistency metrics for video generation."""
+
+    @staticmethod
+    def calculate_ssim_boundary(frame_prev: torch.Tensor, frame_next: torch.Tensor) -> float:
+        """
+        Calculates a simplified Structural Similarity (SSIM) between two frames.
+        frame_prev, frame_next: [1, 3, 1, H, W] or [1, 3, H, W] or [3, H, W]
+        """
+        # Ensure 3D tensors [3, H, W] for calculation
+        while frame_prev.dim() > 3:
+            if frame_prev.shape[0] == 1: frame_prev = frame_prev.squeeze(0)
+            elif frame_prev.shape[2] == 1: frame_prev = frame_prev.squeeze(2) # [1, 3, 1, H, W] -> [1, 3, H, W]
+            else: break
+            
+        while frame_next.dim() > 3:
+            if frame_next.shape[0] == 1: frame_next = frame_next.squeeze(0)
+            elif frame_next.shape[2] == 1: frame_next = frame_next.squeeze(2)
+            else: break
+            
+        # Fallback squeeze to exactly 3 dims if still more
+        if frame_prev.dim() > 3: frame_prev = frame_prev.view(3, frame_prev.shape[-2], frame_prev.shape[-1])
+        if frame_next.dim() > 3: frame_next = frame_next.view(3, frame_next.shape[-2], frame_next.shape[-1])
+            
+        # Ensure same spatial size
+        if frame_prev.shape[-2:] != frame_next.shape[-2:]:
+            frame_next = torch.nn.functional.interpolate(frame_next, 
+                                                        size=frame_prev.shape[-2:], 
+                                                        mode='bilinear')
+
+        # Basic SSIM terms: Luminance, Contrast, Structure
+        # We use a global mean/var for simplicity (Zero-Shot)
+        mu1 = frame_prev.mean()
+        mu2 = frame_next.mean()
+        sigma1sq = frame_prev.var()
+        sigma2sq = frame_next.var()
+        sigma12 = ((frame_prev - mu1) * (frame_next - mu2)).mean()
+        
+        c1 = (0.01 * 1.0)**2
+        c2 = (0.03 * 1.0)**2
+        
+        ssim = ((2 * mu1 * mu2 + c1) * (2 * sigma12 + c2)) / \
+               ((mu1**2 + mu2**2 + c1) * (sigma1sq + sigma2sq + c2))
+        
+        return float(ssim.item())
+
+    @staticmethod
+    def calculate_embedding_drift(embed1: torch.Tensor, embed2: torch.Tensor) -> float:
+        """Calculates cosine distance between two embeddings."""
+        # embed1, embed2: [D] or [1, D]
+        sim = torch.nn.functional.cosine_similarity(embed1.view(1, -1), 
+                                                   embed2.view(1, -1))
+        return float(1.0 - sim.item())
+
+    @staticmethod
+    def calculate_semantic_alignment(latent: torch.Tensor, prompt_embed: torch.Tensor) -> float:
+        """
+        A rough proxy for how well the latent matches the prompt theme.
+        We compare the pooled latent features with the pooled prompt features.
+        """
+        # Mean pool latent [C, T, H, W] -> [C]
+        z_feat = latent.mean(dim=(1, 2, 3)).view(1, -1)
+        
+        # Mean pool prompt [1, L, D] -> [D]
+        p_feat = prompt_embed.mean(dim=1).view(1, -1)
+        
+        # Since C (16) and D (4096) don't match, we use PCA or Projection in training
+        # ZERO-SHOT FALLBACK: We measure the variance of the latent as a proxy for "activity/energy"
+        # compared to prompt "length/complexity". 
+        # For now, let's return a dummy placeholder until we have a proper projector.
+        return 0.5
+
+
+class BenchmarkAnalyzer:
+    """Consolitates results from multiple runs into a comparison report."""
+    
+    def __init__(self, output_dir="./benchmarks"):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+    def save_run_data(self, method_name, benchmark_manager):
+        """Save a single run's data to a JSON file"""
+        data = {
+            "method": method_name,
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "params": benchmark_manager.generation_params,
+            "sections": benchmark_manager.section_benchmarks
+        }
+        
+        filename = os.path.join(self.output_dir, f"run_{method_name}.json")
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=4)
+        print(f"Saved benchmark data for method '{method_name}' to {filename}")
+
+    def generate_comparison_report(self):
+        """Build a Markdown comparison report from all JSON files in the directory"""
+        files = [f for f in os.listdir(self.output_dir) if f.startswith("run_") and f.endswith(".json")]
+        if not files:
+            return "No benchmark data found to compare."
+            
+        all_data = []
+        for file in files:
+            with open(os.path.join(self.output_dir, file), 'r') as f:
+                all_data.append(json.load(f))
+                
+        report = ["# FramePack Context Method Comparison Report\n"]
+        report.append("| Method | Avg. SSIM (Motion) | Identity Drift | VRAM (Max GB) | Speed (FPS) |")
+        report.append("| :--- | :---: | :---: | :---: | :---: |")
+        
+        for run in all_data:
+            method = run["method"]
+            sections = run["sections"]
+            
+            # Aggregate stats
+            ssims = [v["boundary_ssim"] for v in sections.values() if "boundary_ssim" in v]
+            drifts = [v["identity_drift"] for v in sections.values() if "identity_drift" in v]
+            vrams = [v["denoising_memory_end"]["gpu_memory_allocated_gb"] for v in sections.values() if "denoising_memory_end" in v]
+            durations = [v["denoising_duration"] for v in sections.values() if "denoising_duration" in v]
+            
+            avg_ssim = sum(ssims)/len(ssims) if ssims else 0
+            avg_drift = sum(drifts)/len(drifts) if drifts else 0
+            max_vram = max(vrams) if vrams else 0
+            
+            total_frames = run["params"].get("num_frames", 30)
+            total_duration = sum(durations) if durations else 1
+            fps = total_frames / total_duration
+            
+            report.append(f"| {method} | {avg_ssim:.4f} | {avg_drift:.4f} | {max_vram:.2f} | {fps:.2f} |")
+            
+        report_text = "\n".join(report)
+        
+        with open(os.path.join(self.output_dir, "comparison_report.md"), 'w') as f:
+            f.write(report_text)
+            
+        return report_text
