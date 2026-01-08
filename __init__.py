@@ -51,6 +51,7 @@ class WanVACEVideoFramepackSampler2:
                 "num_context_chunks": ("INT", {"default": 5, "min": 1, "max": 20}),
                 "lambda_compression": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
                 "top_k_chunks": ("INT", {"default": 3, "min": 1, "max": 30}),
+                "context_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "multi_prompts": ("STRING", {
                     "default": "A person walking in a park\nThe person starts jogging\nThe person runs faster\nThe person slows down to rest", 
                     "multiline": True
@@ -89,7 +90,7 @@ class WanVACEVideoFramepackSampler2:
 
     def process(self, model, vae, steps, cfg, shift, seed, scheduler,
                 num_frames, width, height, n_ref_frames, force_offload, 
-                context_method, num_context_chunks, lambda_compression, top_k_chunks,
+                context_method, num_context_chunks, lambda_compression, top_k_chunks, context_strength,
                 multi_prompts, encode_prompts=True, tiled_vae=True, ref_images=None, 
                 input_frames=None, input_mask=None, negative_prompt="", 
                 sigmas=None, text_embeds_list=None, wan_t5_model=None):
@@ -137,6 +138,9 @@ class WanVACEVideoFramepackSampler2:
         
         # Parse prompts
         section_prompts = PromptHandler.parse_multi_prompts(multi_prompts, num_sections)
+        print(f"\n[DEBUG] Parsed Prompts:")
+        for i, p in enumerate(section_prompts):
+            print(f"  Section {i}: '{p}'")
         
         # Encode prompts
         if text_encoder is not None:
@@ -150,6 +154,13 @@ class WanVACEVideoFramepackSampler2:
                     text_encoder=text_encoder,
                     device=device
                 )
+                # DEBUG: Check embedding difference
+                pos_emb = text_embed['prompt_embeds']
+                if isinstance(pos_emb, list):
+                    print(f"  [DEBUG] Section {i} Embed Stats: type=list, len={len(pos_emb)}")
+                else:
+                    print(f"  [DEBUG] Section {i} Embed Stats: Shape={pos_emb.shape}, Mean={pos_emb.mean().item():.6f}")
+                
                 section_text_embeds.append(text_embed)
         elif text_embeds_list:
             section_text_embeds = text_embeds_list
@@ -173,6 +184,7 @@ class WanVACEVideoFramepackSampler2:
             num_context_chunks=num_context_chunks,
             lambda_compression=lambda_compression,
             top_k_chunks=top_k_chunks,
+            context_strength=context_strength,
             steps=steps,
             cfg=cfg,
             seed=seed,
@@ -197,7 +209,7 @@ class WanVACEVideoFramepackSampler2:
                                        ref_images, width, height, num_frames,
                                        shift, scheduler_name, 
                                        context_method, num_context_chunks, 
-                                       lambda_compression, top_k_chunks,
+                                       lambda_compression, top_k_chunks, context_strength,
                                        steps, cfg, seed, sigmas,
                                        device, offload_device, force_offload, tiled_vae=True,
                                        n_ref_frames=1):
@@ -234,6 +246,7 @@ class WanVACEVideoFramepackSampler2:
                                           device=device, dtype=vae_dtype)
                 input_masks = torch.ones_like(input_frames, device=device, dtype=vae_dtype)
                 input_frames = [(p * 2 - 1) for p in input_frames]
+                print(f"[DEBUG] Section 0: Input frames prepared. Shape: {input_frames[0].shape}")
                 
                 # Process reference images if provided
                 if ref_images is not None:
@@ -293,9 +306,10 @@ class WanVACEVideoFramepackSampler2:
                 z = [z_bypass]
                 
                 print(f"Bypassing VAE for context. 96-ch Latent shape: {z[0].shape}")
+                print(f"[DEBUG] Context Stats: Mean={z[0].mean().item():.6f}, Std={z[0].std().item():.6f}")
                 
                 # Update ref_images to None since we use latent context
-                ref_images = None
+                # ref_images = None # KEEP REF IMAGES FOR IDENTITY IN CUTS
             
             self.benchmark_manager.benchmark_section(section, 'encoding')  # End encoding
             
@@ -310,7 +324,7 @@ class WanVACEVideoFramepackSampler2:
             
             # Initialize noise
             generator = torch.Generator(device="cpu")
-            generator.manual_seed(seed if seed != -1 else torch.randint(0, 2**32, (1,)).item())
+            generator.manual_seed((seed + section) if seed != -1 else torch.randint(0, 2**32, (1,)).item())
             
             has_ref = ref_images is not None
             noise = torch.randn(
@@ -329,10 +343,11 @@ class WanVACEVideoFramepackSampler2:
             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
             freqs = RoPEEmbeddings.setup_rope_embeddings(model_wrapper, latent.shape[1])
             num_steps = len(timesteps)
+            effective_context_strength = 1 if section == 0 else context_strength
 
             vace_data = [{
                 "context": z,
-                "scale": [1.0] * num_steps,
+                "scale": [effective_context_strength] * num_steps,
                 "start": 0.0,
                 "end": 1.0,
                 "seq_len": seq_len
@@ -370,6 +385,9 @@ class WanVACEVideoFramepackSampler2:
                     freqs=freqs,
                     device=device
                 )
+                
+                
+                # print(f"  [DEBUG] Step {idx}: Prediction Stats: Mean={noise_pred.mean().item():.6f}, Std={noise_pred.std().item():.6f}")
                 
                 # Scheduler step
                 step_args = {"generator": generator}
