@@ -11,6 +11,7 @@ import time
 import gc
 import json
 import os
+from typing import List, Tuple, Dict
 from datetime import datetime
 from tqdm import tqdm
 import psutil
@@ -124,6 +125,12 @@ class BenchmarkManager:
             
             cpu_delta = end_mem['cpu_memory_mb'] - start_mem['cpu_memory_mb']
             self.section_benchmarks[section_id][f"{phase_name}_cpu_memory_delta_mb"] = cpu_delta
+
+    def log_metric(self, section_id, metric_name, value):
+        """Log a custom quality metric for a section"""
+        if section_id not in self.section_benchmarks:
+            self.section_benchmarks[section_id] = {}
+        self.section_benchmarks[section_id][metric_name] = value
     
     def generate_report(self, section_prompts=None):
         """Generate a comprehensive benchmark report"""
@@ -439,6 +446,15 @@ class VAEProcessor:
     
     def encode_frames(self, frames, ref_images, masks=None, tiled_vae=False):
         """Encode frames to latent space"""
+        print(f"VAE Encoding debug:")
+        print(f"  Input frames type: {type(frames)}")
+        if isinstance(frames, list):
+             print(f"  Input frames list len: {len(frames)}")
+             if len(frames) > 0:
+                 print(f"  Frame 0 shape: {frames[0].shape}")
+        elif isinstance(frames, torch.Tensor):
+             print(f"  Input frames shape: {frames.shape}")
+             
         if ref_images is None:
             ref_images = [None] * len(frames)
         else:
@@ -458,13 +474,24 @@ class VAEProcessor:
         
         for latent, refs in zip(latents, ref_images):
             if refs is not None:
-                if masks is None:
-                    ref_latent = self.vae.encode(refs, device=self.device, tiled=tiled_vae)
-                else:
-                    ref_latent = self.vae.encode(refs, device=self.device, tiled=tiled_vae)
-                    ref_latent = [torch.cat((u, torch.zeros_like(u)), dim=0) for u in ref_latent]
-                assert all([x.shape[1] == 1 for x in ref_latent])
-                latent = torch.cat([*ref_latent, latent], dim=1)
+                # Ensure refs is wrapped in a list if it's a single tensor
+                # vae.encode expects [4D_Tensor] or 5D_Tensor
+                ref_input = refs if isinstance(refs, list) else [refs]
+                ref_latent_list = self.vae.encode(ref_input, device=self.device, tiled=tiled_vae)
+                
+                # Squeeze 5D latents [1, 16, T, H, W] to 4D [16, T, H, W]
+                # Each element in ref_latent_list should be 5D if tiled=tiled_vae
+                ref_latent_list = [u.squeeze(0) if u.dim() == 5 else u for u in ref_latent_list]
+                
+                if masks is not None:
+                    # In VACE mode, reference frames usually have an empty reactive channel (32 channels total)
+                    # Note: WanVideo VAE in this wrapper might return 16 channels.
+                    # If latent has 32, we must cat with zeros.
+                    if latent.shape[0] == 32:
+                        ref_latent_list = [torch.cat((u, torch.zeros_like(u)), dim=0) for u in ref_latent_list]
+
+                # Cat on dim=1 (Temporal)
+                latent = torch.cat([*ref_latent_list, latent], dim=1)
             cat_latents.append(latent)
         
         return cat_latents
@@ -497,8 +524,17 @@ class VAEProcessor:
             mask = F.interpolate(mask.unsqueeze(0), size=(new_depth, height, width), mode='nearest-exact').squeeze(0)
 
             if refs is not None:
-                length = len(refs)
-                mask_pad = torch.zeros_like(mask[:, :length, :, :])
+                # Calculate latent temporal dimension for reference images
+                # refs shape is [C, T, H, W]
+                pixel_frames = refs.shape[1]
+                latent_ref_length = (pixel_frames - 1) // VAE_STRIDE[0] + 1
+                
+                # Create zero mask for reference frames
+                mask_pad = torch.zeros(
+                    (mask.shape[0], latent_ref_length, mask.shape[2], mask.shape[3]),
+                    device=mask.device,
+                    dtype=mask.dtype
+                )
                 mask = torch.cat((mask_pad, mask), dim=1)
             result_masks.append(mask)
         
@@ -511,6 +547,14 @@ class VAEProcessor:
     def decode_latent(self, zs, ref_images=None):
         """Decode latents back to frames"""
         return self.vae.decode(zs, device=self.device)
+
+    def decode_single_frame(self, latent, index=-1):
+        """Decode a specific frame index from a latent tensor [C, T, H, W]"""
+        # latent is usually [C, T, H, W]
+        # We need to wrap it for the VAE which expects [B, C, T, H, W] or list
+        # FramePack VAE expects a list of tensors
+        single_latent = latent[:, index:index+1, :, :].clone()
+        return self.vae.decode([single_latent], device=self.device)
 
 
 class ContextBuilder:
@@ -535,12 +579,12 @@ class ContextBuilder:
         Enhanced hierarchical context selection with constant 41-frame output.
         """
         # Constants
-        LONG_FRAMES = 5
-        MID_FRAMES = 3
-        RECENT_FRAMES = 1
-        OVERLAP_FRAMES = 2
+        LONG_FRAMES = 14
+        MID_FRAMES = 8
+        RECENT_FRAMES = 3
+        OVERLAP_FRAMES = 5
         GEN_FRAMES = 30
-        TOTAL_FRAMES = 41
+        TOTAL_FRAMES = 60
 
         C, T, H, W = frames.shape
 
@@ -552,63 +596,26 @@ class ContextBuilder:
             padding = torch.zeros((C, padding_needed, H, W), device=frames.device)
             return torch.cat([frames, padding], dim=1)
 
-        selected_indices = []
-
-        # Long-term context
-        if T >= 40:
-            step = max(4, T // 20)
-            long_indices = []
-            for i in range(LONG_FRAMES):
-                idx = min(i * step, T - 15)
-                long_indices.append(idx)
-            selected_indices.extend(long_indices)
+        # SIMPLIFIED STRATEGY: Use the last 11 frames contiguously
+        CONTEXT_FRAMES = LONG_FRAMES + MID_FRAMES + RECENT_FRAMES + OVERLAP_FRAMES # 11
+        
+        # Ensure we have enough frames
+        if T < CONTEXT_FRAMES:
+             # Fallback if not enough frames (unlikely after section 0)
+             context_frames = frames
+             padding = torch.zeros((C, CONTEXT_FRAMES - T, H, W), device=frames.device)
+             context_frames = torch.cat([padding, context_frames], dim=1)
         else:
-            if T >= LONG_FRAMES:
-                step = T // LONG_FRAMES
-                long_indices = [i * step for i in range(LONG_FRAMES)]
-            else:
-                long_indices = list(range(T))
-                while len(long_indices) < LONG_FRAMES:
-                    long_indices.append(T - 1)
-            selected_indices.extend(long_indices[:LONG_FRAMES])
+             context_frames = frames[:, -CONTEXT_FRAMES:, :, :]
 
-        # Mid-term context
-        mid_start = max(LONG_FRAMES, T - 15)
-        mid_indices = [
-            min(mid_start, T - 1),
-            min(mid_start + 2, T - 1)
-        ]
-        selected_indices.extend(mid_indices)
+        # Return ONLY the context frames, do not pad with placeholder yet
+        # We will handle padding in pixel space after decoding
+        final_frames = context_frames
 
-        # Recent context
-        recent_idx = max(0, T - 5)
-        selected_indices.append(recent_idx)
-
-        # Overlap frames
-        overlap_start = max(0, T - OVERLAP_FRAMES)
-        overlap_indices = list(range(overlap_start, T))
-        while len(overlap_indices) < OVERLAP_FRAMES:
-            overlap_indices.append(T - 1)
-        selected_indices.extend(overlap_indices[:OVERLAP_FRAMES])
-
-        context_frames = frames[:, selected_indices, :, :]
-        gen_placeholder = torch.zeros((C, GEN_FRAMES, H, W), device=frames.device)
-
-        final_frames = torch.cat([
-            context_frames[:, :LONG_FRAMES],
-            context_frames[:, LONG_FRAMES:LONG_FRAMES+MID_FRAMES],
-            context_frames[:, LONG_FRAMES+MID_FRAMES:LONG_FRAMES+MID_FRAMES+RECENT_FRAMES],
-            context_frames[:, -OVERLAP_FRAMES:],
-            gen_placeholder
-        ], dim=1)
-
-        assert final_frames.shape[1] == TOTAL_FRAMES, \
-            f"Expected {TOTAL_FRAMES} frames, got {final_frames.shape[1]}"
-
-        if section_id % 5 == 0:
+        if section_id % 5 == 0 or True: # Always print for now
             print(f"\nContext selection debug (section {section_id}):")
             print(f"  Input frames: {T}")
-            print(f"  Selected indices: {selected_indices}")
+            print(f"  Strategy: Contiguous last {CONTEXT_FRAMES} frames")
             print(f"  Output shape: {final_frames.shape}")
 
         return final_frames
@@ -623,18 +630,23 @@ class MaskGenerator:
         C, T, H, W = frame_shape
         
         # Constants
-        LATENT_FRAMES = 41
+        LATENT_FRAMES = 60
         decoded_frames = T
         expansion_ratio = decoded_frames / LATENT_FRAMES
         
         mask = torch.zeros(3, decoded_frames, H, W, device=device)
         
         # Scale all frame counts by the expansion ratio
-        LONG_FRAMES = int(5 * expansion_ratio)
-        MID_FRAMES = int(3 * expansion_ratio)
-        RECENT_FRAMES = int(1 * expansion_ratio)
-        OVERLAP_FRAMES = int(2 * expansion_ratio)
+        LONG_FRAMES = int(14 * expansion_ratio)
+        MID_FRAMES = int(8 * expansion_ratio)
+        RECENT_FRAMES = int(3 * expansion_ratio)
+        OVERLAP_FRAMES = int(5 * expansion_ratio)
         GEN_FRAMES = decoded_frames - (LONG_FRAMES + MID_FRAMES + RECENT_FRAMES + OVERLAP_FRAMES)
+        
+        print(f"\nMask generation debug (section {section_id}):")
+        print(f"  Decoded frames: {decoded_frames}")
+        print(f"  Expansion ratio: {expansion_ratio}")
+        print(f"  Segments: L={LONG_FRAMES}, M={MID_FRAMES}, R={RECENT_FRAMES}, O={OVERLAP_FRAMES}, Gen={GEN_FRAMES}")
         
         if initial:
             mask[:, :-GEN_FRAMES] = 0.0
@@ -714,12 +726,14 @@ class ReferenceImageProcessor:
     """Handles reference image processing"""
     
     @staticmethod
-    def process_reference_images(ref_images, width, height, device, dtype):
+    def process_reference_images(ref_images, width, height, device, dtype, target_ref_count=1):
         """Process reference images for generation"""
-        if ref_images.shape[0] > 1:
-            ref_images = torch.cat([ref_images[i] for i in range(ref_images.shape[0])], 
-                                dim=1).unsqueeze(0)
-    
+        
+        # Handle duplication if requested
+        if ref_images.shape[0] == 1 and target_ref_count > 1:
+            print(f"Duplicating single reference image {target_ref_count} times")
+            ref_images = ref_images.repeat(target_ref_count, 1, 1, 1)
+
         B, H, W, C = ref_images.shape
         current_aspect = W / H
         target_aspect = width / height
@@ -740,9 +754,381 @@ class ReferenceImageProcessor:
             ref_images = padded
             
         ref_images = common_upscale(ref_images.movedim(-1, 1), width, height, 
-                                "lanczos", "center").movedim(1, -1)
-        ref_images = ref_images.to(dtype).to(device).unsqueeze(0)
-        ref_images = ref_images.permute(0, 4, 1, 2, 3).unsqueeze(0)
-        ref_images = ref_images * 2 - 1
+                                "lanczos", "center")
+        ref_images = ref_images.movedim(0, 1) # [C, T, H, W]
+        ref_images = (ref_images.to(dtype).to(device) * 2 - 1)
         
-        return ref_images
+        return [ref_images]
+
+
+class FramePackCompressor:
+    """
+    Handles hierarchical compression of latent history in latent space.
+    Recent history stays high-res; deep history is pooled.
+    """
+    def __init__(self, 
+                 lambda_compression: float = 2.0,
+                 max_history_frames: int = 120):
+        
+        self.lambda_compression = lambda_compression
+        self.max_history_frames = max_history_frames
+        
+        # Kernel sizes for different levels of compression
+        self.base_kernels = [
+            (1, 1, 1),   # Level 0: 1x
+            (1, 2, 2),   # Level 1: 4x
+            (2, 2, 2),   # Level 2: 8x
+            (2, 4, 4),   # Level 3: 32x
+            (4, 8, 8),   # Level 4: 256x
+        ]
+
+    def _get_kernel_for_section(self, section_age: int) -> Tuple[int, int, int]:
+        """Calculates kernel size based on section age and lambda"""
+        if section_age == 0:
+            return (1, 1, 1)
+        
+        # Exponential growth of compression: lambda^(age)
+        target_rate = self.lambda_compression ** section_age
+        
+        # Find best kernel from our presets
+        best_kernel = self.base_kernels[0]
+        for kernel in self.base_kernels:
+            rate = kernel[0] * kernel[1] * kernel[2]
+            if rate <= target_rate:
+                best_kernel = kernel
+            else:
+                break
+        return best_kernel
+
+    def compress_latent(self, latent: torch.Tensor, kernel: Tuple[int, int, int]) -> torch.Tensor:
+        """Applies avg_pool3d to compress latent dimensions"""
+        if kernel == (1, 1, 1):
+            return latent
+        
+        # latent is [C, T, H, W]
+        # avg_pool3d expects [N, C, T, H, W]
+        with torch.no_grad():
+            compressed = F.avg_pool3d(
+                latent.unsqueeze(0),
+                kernel_size=kernel,
+                stride=kernel
+            ).squeeze(0)
+        return compressed
+
+    def prepare_context(self, accumulated_latents: List[torch.Tensor], section_id: int) -> torch.Tensor:
+        """
+        Builds a single context tensor from the list of historical latent sections.
+        Sections are compressed according to their age.
+        """
+        if not accumulated_latents:
+            return None
+            
+        # Reverse history so newest is index 0
+        history = list(reversed(accumulated_latents))
+        
+        processed_sections = []
+        for age, section in enumerate(history):
+            kernel = self._get_kernel_for_section(age)
+            compressed = self.compress_latent(section, kernel)
+            processed_sections.append(compressed)
+            
+            # Limit history to prevent runaway sequence length
+            if len(processed_sections) >= self.max_history_frames // 10:
+                break
+        
+        # Concatenate into one temporal block
+        # Note: Since they have different H, W after pooling, we pad to match the largest
+        max_h = max(s.shape[2] for s in processed_sections)
+        max_w = max(s.shape[3] for s in processed_sections)
+        
+        padded = []
+        for s in processed_sections:
+            if s.shape[2] < max_h or s.shape[3] < max_w:
+                pad_h = max_h - s.shape[2]
+                pad_w = max_w - s.shape[3]
+                s = F.pad(s, (0, pad_w, 0, pad_h))
+            padded.append(s)
+            
+        return torch.cat(padded, dim=1)
+
+
+class SparseSelector:
+    """
+    Selects frames with exponential backoff to preserve long-term identity.
+    Example: [Last 5 frames, then T-10, T-30, T-60, Frame 0]
+    """
+    @staticmethod
+    def pick_sparse_context(accumulated_latents: List[torch.Tensor], num_frames: int = 30) -> torch.Tensor:
+        if not accumulated_latents:
+            return None
+            
+        all_frames = torch.cat(accumulated_latents, dim=1)
+        total_t = all_frames.shape[1]
+        
+        if total_t <= num_frames:
+            return all_frames
+            
+        # Select indices
+        indices = []
+        
+        # 1. Always include the very first frame (Identity Anchor)
+        indices.append(0)
+        
+        # 2. Always include the last N/2 frames (Continuity)
+        recent_count = num_frames // 2
+        indices.extend(range(total_t - recent_count, total_t))
+        
+        # 3. Fill the rest with exponential spacing from the past
+        remaining = num_frames - len(indices)
+        if remaining > 0:
+            # Calculate points between Frame 1 and (Total - Recent)
+            search_end = total_t - recent_count - 1
+            if search_end > 1:
+                # Use log space for selection
+                log_points = np.linspace(np.log(1), np.log(search_end), remaining)
+                sparse_indices = np.exp(log_points).astype(int)
+                indices.extend(sparse_indices.tolist())
+        
+        # Unique and sorted
+        final_indices = sorted(list(set(indices)))
+        
+        # If we have too many (due to overlaps), take the most important ones
+        if len(final_indices) > num_frames:
+            final_indices = final_indices[-num_frames:]
+            
+        return all_frames[:, final_indices, :, :]
+
+
+class MoCRouter:
+    """
+    Mixture of Contexts Router (Outer Loop).
+    Retrieves historical chunks based on semantic similarity to the current prompt.
+    """
+    @staticmethod
+    def retrieve_context(accumulated_latents: List[torch.Tensor], 
+                         current_prompt_embeds: torch.Tensor,
+                         top_k: int = 3) -> torch.Tensor:
+        """
+        current_prompt_embeds: [1, L, D]
+        returns: Concatenated top-k most similar latent chunks.
+        """
+        if not accumulated_latents:
+            return None
+            
+        if len(accumulated_latents) <= top_k:
+            return torch.cat(accumulated_latents, dim=1)
+            
+        # 1. Prepare Query: Mean pool the prompt embeddings
+        # current_prompt_embeds is usually a list or dict in this node
+        if isinstance(current_prompt_embeds, dict):
+            query = current_prompt_embeds["prompt_embeds"]
+        else:
+            query = current_prompt_embeds
+            
+        # If it's a list, take the first one
+        if isinstance(query, list):
+            query = query[0]
+            
+        # query shape: [1, seq_len, dim] -> [dim]
+        query_vec = query.mean(dim=1).flatten()
+        
+        # 2. Prepare Keys: Mean pool each historical chunk
+        chunk_scores = []
+        for i, chunk in enumerate(accumulated_latents):
+            # chunk shape: [C, T, H, W] -> [C]
+            key_vec = chunk.mean(dim=(1, 2, 3)).flatten()
+            
+            # 3. Calculate Cosine Similarity
+            # Note: Wan Video latents (16 channels) and T5 embeds (4096 dim) 
+            # don't match directly. We use high-level spatial correlations.
+            
+            # ZERO-SHOT TRANSLATION:
+            # Inner Loop: Current Query (Q) vs Historical Keys (K)
+            # Outer Loop (Ours): Last Frame Feature (Query Ref) vs Historical Chunk Means (Keys)
+            
+            # Query Ref: Mean-pool the very last frame of the most recent chunk
+            # accumulated_latents[-1] is [C, T, H, W] -> [C, -1, :, :] -> [C]
+            ref_frame_vec = accumulated_latents[-1][:, -1, :, :].mean(dim=(1, 2)).flatten()
+            
+            similarity = F.cosine_similarity(ref_frame_vec.unsqueeze(0), key_vec.unsqueeze(0))
+            chunk_scores.append((i, similarity.item()))
+            
+        # 4. Select Top-K
+        chunk_scores.sort(key=lambda x: x[1], reverse=True)
+        selected_indices = sorted([x[0] for x in chunk_scores[:top_k]])
+        
+        # 5. Always include the most recent chunk for continuity
+        recent_idx = len(accumulated_latents) - 1
+        if recent_idx not in selected_indices:
+            selected_indices[-1] = recent_idx # Replace least similar with most recent
+            selected_indices.sort()
+            
+        selected_chunks = [accumulated_latents[i] for i in selected_indices]
+        return torch.cat(selected_chunks, dim=1)
+
+
+class VideoMetrics:
+    """Calculates quality and consistency metrics for video generation."""
+
+    @staticmethod
+    def _create_window(window_size, channel):
+        def gaussian(window_size, sigma):
+            gauss = torch.tensor([math.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
+            return gauss/gauss.sum()
+
+        _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+        window = torch.Tensor(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
+        return window
+
+    @staticmethod
+    def _ssim(img1, img2, window_size=11, size_average=True):
+        channel = img1.size(1)
+        window = VideoMetrics._create_window(window_size, channel).to(img1.device).type(img1.dtype)
+
+        mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+        mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+
+        mu1_sq = mu1.pow(2)
+        mu2_sq = mu2.pow(2)
+        mu1_mu2 = mu1 * mu2
+
+        sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
+        sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
+        sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+
+        C1 = 0.01**2
+        C2 = 0.03**2
+
+        ssim_map = ((2*mu1_mu2 + C1) * (2*sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+        if size_average:
+            return ssim_map.mean()
+        else:
+            return ssim_map.mean(1).mean(1).mean(1)
+
+    @staticmethod
+    def calculate_ssim_boundary(frame_prev: torch.Tensor, frame_next: torch.Tensor) -> float:
+        """
+        Calculates Structural Similarity (SSIM) between two frames using Gaussian window.
+        Input shapes: [1, 3, 1, H, W] or [1, 3, H, W] or [3, H, W]
+        """
+        # Ensure 4D tensors [1, 3, H, W] for calculation
+        if frame_prev.dim() == 5: frame_prev = frame_prev.squeeze(2) # [1, 3, 1, H, W] -> [1, 3, H, W]
+        if frame_next.dim() == 5: frame_next = frame_next.squeeze(2)
+            
+        if frame_prev.dim() == 3: frame_prev = frame_prev.unsqueeze(0) # [3, H, W] -> [1, 3, H, W]
+        if frame_next.dim() == 3: frame_next = frame_next.unsqueeze(0)
+            
+        # Ensure same spatial size
+        if frame_prev.shape[-2:] != frame_next.shape[-2:]:
+            frame_next = torch.nn.functional.interpolate(frame_next, 
+                                                        size=frame_prev.shape[-2:], 
+                                                        mode='bilinear')
+
+        # Run SSIM
+        ssim_val = VideoMetrics._ssim(frame_prev, frame_next)
+        
+        return float(ssim_val.item())
+
+    @staticmethod
+    def calculate_embedding_drift(embed1: torch.Tensor, embed2: torch.Tensor) -> float:
+        """Calculates cosine distance between two embeddings."""
+        # embed1, embed2: [D] or [1, D]
+        sim = torch.nn.functional.cosine_similarity(embed1.view(1, -1), 
+                                                   embed2.view(1, -1))
+        return float(1.0 - sim.item())
+
+    @staticmethod
+    def calculate_semantic_alignment(latent: torch.Tensor, prompt_embed: torch.Tensor) -> float:
+        """
+        A rough proxy for how well the latent matches the prompt theme.
+        We compare the pooled latent features with the pooled prompt features.
+        """
+        # Mean pool latent [C, T, H, W] -> [C]
+        z_feat = latent.mean(dim=(1, 2, 3)).view(1, -1)
+        
+        # Mean pool prompt [1, L, D] -> [D]
+        p_feat = prompt_embed.mean(dim=1).view(1, -1)
+        
+        
+        torch.manual_seed(42) # Fixed seed for consistency across checks
+        C = z_feat.shape[1]
+        D = p_feat.shape[1]
+        target_dim = min(C, D)
+        
+        # Simple projection matrix
+        proj_z = torch.randn(C, target_dim, device=latent.device) / math.sqrt(C)
+        proj_p = torch.randn(D, target_dim, device=latent.device) / math.sqrt(D)
+        
+        z_proj = torch.mm(z_feat, proj_z)
+        p_proj = torch.mm(p_feat, proj_p)
+        
+        sim = torch.nn.functional.cosine_similarity(z_proj, p_proj)
+        
+        # Rescale from [-1, 1] to [0, 1] for metric consistency
+        return float(0.5 * (sim.item() + 1.0))
+
+
+class BenchmarkAnalyzer:
+    """Consolitates results from multiple runs into a comparison report."""
+    
+    def __init__(self, output_dir="./benchmarks"):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+    def save_run_data(self, method_name, benchmark_manager):
+        """Save a single run's data to a JSON file"""
+        data = {
+            "method": method_name,
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "params": benchmark_manager.generation_params,
+            "sections": benchmark_manager.section_benchmarks
+        }
+        
+        filename = os.path.join(self.output_dir, f"run_{method_name}.json")
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=4)
+        print(f"Saved benchmark data for method '{method_name}' to {filename}")
+
+    def generate_comparison_report(self):
+        """Build a Markdown comparison report from all JSON files in the directory"""
+        files = [f for f in os.listdir(self.output_dir) if f.startswith("run_") and f.endswith(".json")]
+        if not files:
+            return "No benchmark data found to compare."
+            
+        all_data = []
+        for file in files:
+            with open(os.path.join(self.output_dir, file), 'r') as f:
+                all_data.append(json.load(f))
+                
+        report = ["# FramePack Context Method Comparison Report\n"]
+        report.append("| Method | Avg. SSIM (Motion) | Identity Drift | VRAM (Max GB) | Speed (FPS) |")
+        report.append("| :--- | :---: | :---: | :---: | :---: |")
+        
+        for run in all_data:
+            method = run["method"]
+            sections = run["sections"]
+            
+            # Aggregate stats
+            ssims = [v["boundary_ssim"] for v in sections.values() if "boundary_ssim" in v]
+            drifts = [v["identity_drift"] for v in sections.values() if "identity_drift" in v]
+            vrams = [v["denoising_memory_end"]["gpu_memory_allocated_gb"] for v in sections.values() if "denoising_memory_end" in v]
+            durations = [v["denoising_duration"] for v in sections.values() if "denoising_duration" in v]
+            
+            avg_ssim = sum(ssims)/len(ssims) if ssims else 0
+            avg_drift = sum(drifts)/len(drifts) if drifts else 0
+            max_vram = max(vrams) if vrams else 0
+            
+            total_frames = run["params"].get("num_frames", 30)
+            total_duration = sum(durations) if durations else 1
+            fps = total_frames / total_duration
+            
+            report.append(f"| {method} | {avg_ssim:.4f} | {avg_drift:.4f} | {max_vram:.2f} | {fps:.2f} |")
+            
+        report_text = "\n".join(report)
+        
+        with open(os.path.join(self.output_dir, "comparison_report.md"), 'w') as f:
+            f.write(report_text)
+            
+        return report_text
