@@ -17,15 +17,20 @@ from .framepack_helpers import (
     MaskGenerator,
     FrequencyProcessor,
     ReferenceImageProcessor,
-    VAE_STRIDE
+    VAE_STRIDE,
+    SparseSelector,
+    MoCRouter,
+    FramePackCompressor,
+    VideoMetrics,
+    BenchmarkAnalyzer
 )
 import time
 from diffusers.schedulers import DEISMultistepScheduler
 from .wanvideo.utils.basic_flowmatch import FlowMatchScheduler
 
 
-
 class WanVACEVideoFramepackSampler2:
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -37,15 +42,22 @@ class WanVACEVideoFramepackSampler2:
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "scheduler": (["dpm++", "unipc", "euler", "deis", "lcm"], {"default": "unipc"}),
-                "num_frames": ("INT", {"default": 81, "min": 41, "max": 1000, "step": 1}),
+                "num_frames": ("INT", {"default": 121, "min": 41, "max": 1000, "step": 1}),
                 "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8}),
                 "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 8}),
+                "n_ref_frames": ("INT", {"default": 1, "min": 1, "max": 121, "step": 1}),
                 "force_offload": ("BOOLEAN", {"default": True}),
+                "context_method": (["contiguous", "sparse", "moc", "frame"], {"default": "contiguous"}),
+                "num_context_chunks": ("INT", {"default": 5, "min": 1, "max": 20}),
+                "lambda_compression": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
+                "top_k_chunks": ("INT", {"default": 3, "min": 1, "max": 30}),
+                "context_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "multi_prompts": ("STRING", {
                     "default": "A person walking in a park\nThe person starts jogging\nThe person runs faster\nThe person slows down to rest", 
                     "multiline": True
                 }),
                 "encode_prompts": ("BOOLEAN", {"default": True}),
+                "tiled_vae": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "sigmas": ("SIGMAS",),
@@ -65,6 +77,9 @@ class WanVACEVideoFramepackSampler2:
     DESCRIPTION = "A sampler specifically for the FramePack algorithm for long video generation using hierarchical context."
 
     def __init__(self):
+        self.vae_processor = None
+        self.frame_compressor = None
+        self.device = None
         self.cache_state = None
         self.benchmark_manager = BenchmarkManager()
         
@@ -74,10 +89,11 @@ class WanVACEVideoFramepackSampler2:
         torch.backends.cudnn.allow_tf32 = True
 
     def process(self, model, vae, steps, cfg, shift, seed, scheduler,
-                num_frames, width, height, force_offload, multi_prompts,
-                encode_prompts=True, ref_images=None, input_frames=None, 
-                input_mask=None, negative_prompt="", sigmas=None, 
-                text_embeds_list=None, wan_t5_model=None):
+                num_frames, width, height, n_ref_frames, force_offload, 
+                context_method, num_context_chunks, lambda_compression, top_k_chunks, context_strength,
+                multi_prompts, encode_prompts=True, tiled_vae=True, ref_images=None, 
+                input_frames=None, input_mask=None, negative_prompt="", 
+                sigmas=None, text_embeds_list=None, wan_t5_model=None):
         """Main processing function for ComfyUI with multi-prompt support"""
         
         enable_benchmarking = True
@@ -106,8 +122,10 @@ class WanVACEVideoFramepackSampler2:
         model_obj = model.model
         model_wrapper = model_obj.diffusion_model
         
-        # Setup VAE
-        self.vae_processor = VAEProcessor(vae.to(device).to(torch.float32), device)
+        # Setup VAE and Helper
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        self.vae_processor = VAEProcessor(vae.to(device).to(dtype), device)
+        self.frame_compressor = FramePackCompressor(lambda_compression=lambda_compression)
         model_wrapper.to(device)
         
         # Ensure dimensions are multiples of 16
@@ -115,11 +133,14 @@ class WanVACEVideoFramepackSampler2:
         height = (height // 16) * 16
         
         # Calculate number of sections
-        INITIAL_FRAMES = 81
+        INITIAL_FRAMES = 121
         num_sections = 1 if num_frames <= INITIAL_FRAMES else math.ceil(num_frames / INITIAL_FRAMES)
         
         # Parse prompts
         section_prompts = PromptHandler.parse_multi_prompts(multi_prompts, num_sections)
+        print(f"\n[DEBUG] Parsed Prompts:")
+        for i, p in enumerate(section_prompts):
+            print(f"  Section {i}: '{p}'")
         
         # Encode prompts
         if text_encoder is not None:
@@ -133,6 +154,13 @@ class WanVACEVideoFramepackSampler2:
                     text_encoder=text_encoder,
                     device=device
                 )
+                # DEBUG: Check embedding difference
+                pos_emb = text_embed['prompt_embeds']
+                if isinstance(pos_emb, list):
+                    print(f"  [DEBUG] Section {i} Embed Stats: type=list, len={len(pos_emb)}")
+                else:
+                    print(f"  [DEBUG] Section {i} Embed Stats: Shape={pos_emb.shape}, Mean={pos_emb.mean().item():.6f}")
+                
                 section_text_embeds.append(text_embed)
         elif text_embeds_list:
             section_text_embeds = text_embeds_list
@@ -152,13 +180,20 @@ class WanVACEVideoFramepackSampler2:
             num_frames=num_frames,
             shift=shift,
             scheduler_name=scheduler,
+            context_method=context_method,
+            num_context_chunks=num_context_chunks,
+            lambda_compression=lambda_compression,
+            top_k_chunks=top_k_chunks,
+            context_strength=context_strength,
             steps=steps,
             cfg=cfg,
             seed=seed,
             sigmas=sigmas,
             device=device,
             offload_device=offload_device,
-            force_offload=force_offload
+            force_offload=force_offload,
+            tiled_vae=tiled_vae,
+            n_ref_frames=n_ref_frames
         )
         
         # Generate and save benchmark report
@@ -172,19 +207,27 @@ class WanVACEVideoFramepackSampler2:
     def _generate_with_framepack_multi(self, model_wrapper, section_text_embeds, 
                                        section_prompts, input_frames, input_masks, 
                                        ref_images, width, height, num_frames,
-                                       shift, scheduler_name, steps, cfg, seed, sigmas,
-                                       device, offload_device, force_offload):
+                                       shift, scheduler_name, 
+                                       context_method, num_context_chunks, 
+                                       lambda_compression, top_k_chunks, context_strength,
+                                       steps, cfg, seed, sigmas,
+                                       device, offload_device, force_offload, tiled_vae=True,
+                                       n_ref_frames=1):
         """Core FramePack generation algorithm with multi-prompt support"""
         
-        vae_dtype = torch.float32
+        vae_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         all_generated_latents = []
         accumulated_latents = []
         total_output_frames = 0
 
-        LATENT_WINDOW = 41
+        LATENT_WINDOW = 60
         GENERATION_FRAMES = 30
-        CONTEXT_FRAMES = 11
-        INITIAL_FRAMES = 81
+        CONTEXT_FRAMES = 30
+        INITIAL_FRAMES = 121
+        
+        # Initialize analyzer
+        analyzer = BenchmarkAnalyzer()
+        reference_character_embed = None
         
         num_sections = 1 if num_frames <= INITIAL_FRAMES else math.ceil(num_frames / INITIAL_FRAMES)
         
@@ -198,18 +241,26 @@ class WanVACEVideoFramepackSampler2:
             self.benchmark_manager.benchmark_section(section, 'encoding')
             
             if section == 0:
-                # Initial section setup
+                # Initial section setup (Section 0)
                 input_frames = torch.zeros(1, 3, INITIAL_FRAMES, height, width, 
                                           device=device, dtype=vae_dtype)
                 input_masks = torch.ones_like(input_frames, device=device, dtype=vae_dtype)
-                input_frames = [(f * 2 - 1) for f in input_frames]
+                input_frames = [(p * 2 - 1) for p in input_frames]
+                print(f"[DEBUG] Section 0: Input frames prepared. Shape: {input_frames[0].shape}")
                 
                 # Process reference images if provided
                 if ref_images is not None:
                     ref_images = ReferenceImageProcessor.process_reference_images(
-                        ref_images, width, height, device, vae_dtype
+                        ref_images, width, height, device, vae_dtype, n_ref_frames
                     )
                 
+                # Encode to latent space (Only for Section 0)
+                z0 = self.vae_processor.encode_frames(input_frames, ref_images=ref_images, 
+                                                     masks=input_masks, tiled_vae=tiled_vae)
+                m0 = self.vae_processor.encode_masks(input_masks, ref_images=ref_images)
+                z = self.vae_processor.combine_latent(z0, m0)
+                
+                # Setup target shape for reference tracking
                 target_shape = (
                     16,
                     (INITIAL_FRAMES - 1) // VAE_STRIDE[0] + 1,
@@ -217,31 +268,48 @@ class WanVACEVideoFramepackSampler2:
                     width // VAE_STRIDE[2]
                 )
             else:
-                # Build context from previous sections
-                context_latent = ContextBuilder.build_hierarchical_context(accumulated_latents, section)
-                hierarchical_frames = ContextBuilder.pick_context(context_latent, section)
+                # Section > 0 setup (Latent Bypass)
+                # Clear memory before intensive context scaling
+                mm.soft_empty_cache()
+                gc.collect()
                 
-                input_frames = self.vae_processor.decode_latent([hierarchical_frames], None)
-                input_frames[0] = input_frames[0].expand(3, -1, -1, -1)
+                # Context Management Branching
+                if context_method == "frame":
+                    print(f"Using Frame (Pseudo FramePack) context management")
+                    z_context = self.frame_compressor.prepare_context(accumulated_latents, section)
+                elif context_method == "sparse":
+                    print(f"Using Sparse (Anchor-Based) context management")
+                    z_context = SparseSelector.pick_sparse_context(accumulated_latents, CONTEXT_FRAMES)
+                elif context_method == "moc":
+                    print(f"Using MoC (Mixture of Contexts) context management")
+                    z_context = MoCRouter.retrieve_context(accumulated_latents, section_text_embeds[section], top_k=top_k_chunks)
+                else: # Default: Contiguous
+                    print(f"Using Contiguous context management")
+                    z_context = ContextBuilder.pick_context(torch.cat(accumulated_latents, dim=1), section)
+
+                print(f"Context latent shape: {z_context.shape}")
                 
-                input_masks = MaskGenerator.create_temporal_blend_mask(
-                    input_frames[0].shape, section, device
-                )
-                ref_images = None
-                num_frames = input_frames[0].shape[1]
+                # IMPORTANT: Latent-Space Optimization (No VAE round-trip)
+                # Reconstruct 96-channel VACE context structure:
+                # Inactive (16) + Reactive (16) + Mask (64) = 96 channels
                 
-                target_shape = (
-                    16,
-                    (num_frames - 1) // VAE_STRIDE[0] + 1,
-                    height // VAE_STRIDE[1],
-                    width // VAE_STRIDE[2]
-                )
-            
-            # Encode to latent space
-            z0 = self.vae_processor.encode_frames(input_frames, ref_images=ref_images, 
-                                                 masks=input_masks, tiled_vae=False)
-            m0 = self.vae_processor.encode_masks(input_masks, ref_images=ref_images)
-            z = self.vae_processor.combine_latent(z0, m0)
+                blend_val = 0.05 # Anchor strength
+                u = z_context * (1.0 - blend_val)
+                c = z_context * blend_val
+                
+                # 64-channel encoded mask (spatial patches folded into channels)
+                # Since we use a uniform value, repetition is correct.
+                m_vace = torch.ones((64, z_context.shape[1], z_context.shape[2], z_context.shape[3]), 
+                                   device=device, dtype=vae_dtype) * blend_val
+                
+                z_bypass = torch.cat([u, c, m_vace], dim=0)
+                z = [z_bypass]
+                
+                print(f"Bypassing VAE for context. 96-ch Latent shape: {z[0].shape}")
+                print(f"[DEBUG] Context Stats: Mean={z[0].mean().item():.6f}, Std={z[0].std().item():.6f}")
+                
+                # Update ref_images to None since we use latent context
+                # ref_images = None # KEEP REF IMAGES FOR IDENTITY IN CUTS
             
             self.benchmark_manager.benchmark_section(section, 'encoding')  # End encoding
             
@@ -256,15 +324,15 @@ class WanVACEVideoFramepackSampler2:
             
             # Initialize noise
             generator = torch.Generator(device="cpu")
-            generator.manual_seed(seed if seed != -1 else torch.randint(0, 2**32, (1,)).item())
+            generator.manual_seed((seed + section) if seed != -1 else torch.randint(0, 2**32, (1,)).item())
             
             has_ref = ref_images is not None
             noise = torch.randn(
-                target_shape[0],
-                target_shape[1] + (1 if has_ref else 0),
-                target_shape[2],
-                target_shape[3],
-                dtype=torch.float32,
+                16, # Always 16 channels for Wan Video model
+                z[0].shape[1],
+                z[0].shape[2],
+                z[0].shape[3],
+                dtype=vae_dtype,
                 device="cpu",
                 generator=generator
             )
@@ -275,10 +343,11 @@ class WanVACEVideoFramepackSampler2:
             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
             freqs = RoPEEmbeddings.setup_rope_embeddings(model_wrapper, latent.shape[1])
             num_steps = len(timesteps)
+            effective_context_strength = 1 if section == 0 else context_strength
 
             vace_data = [{
                 "context": z,
-                "scale": [1.0] * num_steps,
+                "scale": [effective_context_strength] * num_steps,
                 "start": 0.0,
                 "end": 1.0,
                 "seq_len": seq_len
@@ -317,6 +386,9 @@ class WanVACEVideoFramepackSampler2:
                     device=device
                 )
                 
+                
+                # print(f"  [DEBUG] Step {idx}: Prediction Stats: Mean={noise_pred.mean().item():.6f}, Std={noise_pred.std().item():.6f}")
+                
                 # Scheduler step
                 step_args = {"generator": generator}
                 if isinstance(sample_scheduler, (DEISMultistepScheduler, FlowMatchScheduler)):
@@ -342,8 +414,10 @@ class WanVACEVideoFramepackSampler2:
             
             # Handle accumulation based on section
             if section == 0:
-                if ref_images is not None:
-                    latent_without_ref = latent[:, 1:, :, :]
+                # Dynamically calculate reference length (noise frames - generation frames)
+                ref_len = latent.shape[1] - target_shape[1]
+                if ref_len > 0:
+                    latent_without_ref = latent[:, ref_len:, :, :]
                 else:
                     latent_without_ref = latent
                 
@@ -354,19 +428,47 @@ class WanVACEVideoFramepackSampler2:
                 if section > 2:
                     accumulated_latents.pop(0)
                 
-                # Add new frames
-                new = latent[:, -GENERATION_FRAMES:, :, :]
-                accumulated_latents.append(new)
-                
-                # Add to final output (skip overlap frames)
+                # Add to final output
+                # The latent returned by the model includes context + new generation
+                # We only want the new generation part
                 new_content = latent[:, -GENERATION_FRAMES:, :, :]
-                new_content = new_content[:, CONTEXT_FRAMES:, :, :]
+                accumulated_latents.append(new_content)
                 all_generated_latents.append(new_content)
                 
                 frames_added = new_content.shape[1]
                 total_output_frames += frames_added
                 print(f"Added {frames_added} frames (total: {total_output_frames})")
             
+            # PHASE 4: EVALUATION (Optional)
+            try:
+                # Capture reference embedding from Section 0 Frame 0
+                if section == 0 and reference_character_embed is None:
+                    # Decode first frame [1, T, H, W] -> [1, 3, H, W]
+                    frame_ref = self.vae_processor.decode_single_frame(all_generated_latents[0], index=0)
+                    # Use model's CLIP encoder if available via model_wrapper
+                    # Since we are zero-shot, we can use the latent features as a proxy if CLIP is hard to reach
+                    reference_character_embed = all_generated_latents[0][:, 0, :, :].mean(dim=(1, 2))
+                    print("Captured reference character embedding for identity tracking.")
+
+                # Calculate boundary SSIM if section > 0
+                if section > 0:
+                    # Previous frame (last frame of previous section or context)
+                    # We use the decoded pixels for a proper SSIM
+                    frame_prev = self.vae_processor.decode_single_frame(all_generated_latents[-2], index=-1)
+                    frame_curr = self.vae_processor.decode_single_frame(all_generated_latents[-1], index=0)
+                    
+                    ssim_val = VideoMetrics.calculate_ssim_boundary(frame_prev, frame_curr)
+                    self.benchmark_manager.log_metric(section, "boundary_ssim", ssim_val)
+                    print(f"Boundary SSIM (Section {section-1} -> {section}): {ssim_val:.4f}")
+                    
+                    # Calculate identity drift
+                    current_embed = all_generated_latents[-1][:, 0, :, :].mean(dim=(1, 2))
+                    drift = VideoMetrics.calculate_embedding_drift(reference_character_embed, current_embed)
+                    self.benchmark_manager.log_metric(section, "identity_drift", drift)
+                    print(f"Identity Drift: {drift:.4f}")
+            except Exception as e:
+                print(f"Metrics calculation error: {e}")
+
             self.benchmark_manager.benchmark_section(section, 'accumulation')  # End accumulation
             
             # Clear cache after section
@@ -381,6 +483,11 @@ class WanVACEVideoFramepackSampler2:
             mm.soft_empty_cache()
             gc.collect()
         
+        # Save benchmark data for this run
+        analyzer.save_run_data(context_method, self.benchmark_manager)
+        report_md = analyzer.generate_comparison_report()
+        print("\n" + report_md)
+        
         final_latent = torch.cat(all_generated_latents, dim=1)
         return final_latent.cpu()
 
@@ -388,7 +495,12 @@ class WanVACEVideoFramepackSampler2:
                          model_wrapper, vace_data, seq_len, freqs, device):
         """Classifier-free guidance prediction"""
         
-        dtype = torch.float32
+        # Use bfloat16 if available, otherwise float16 for better performance
+        try:
+            dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        except:
+            dtype = torch.float16
+            
         latent = latent.to(dtype)
         
         with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype):
