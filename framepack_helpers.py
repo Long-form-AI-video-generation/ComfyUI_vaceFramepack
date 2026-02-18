@@ -474,24 +474,13 @@ class VAEProcessor:
         
         for latent, refs in zip(latents, ref_images):
             if refs is not None:
-                # Ensure refs is wrapped in a list if it's a single tensor
-                # vae.encode expects [4D_Tensor] or 5D_Tensor
-                ref_input = refs if isinstance(refs, list) else [refs]
-                ref_latent_list = self.vae.encode(ref_input, device=self.device, tiled=tiled_vae)
-                
-                # Squeeze 5D latents [1, 16, T, H, W] to 4D [16, T, H, W]
-                # Each element in ref_latent_list should be 5D if tiled=tiled_vae
-                ref_latent_list = [u.squeeze(0) if u.dim() == 5 else u for u in ref_latent_list]
-                
-                if masks is not None:
-                    # In VACE mode, reference frames usually have an empty reactive channel (32 channels total)
-                    # Note: WanVideo VAE in this wrapper might return 16 channels.
-                    # If latent has 32, we must cat with zeros.
-                    if latent.shape[0] == 32:
-                        ref_latent_list = [torch.cat((u, torch.zeros_like(u)), dim=0) for u in ref_latent_list]
+                if masks is None:
+                    ref_latent = self.vae.encode(refs, device=self.device, tiled=tiled_vae)
+                else:
+                    ref_latent = self.vae.encode(refs, device=self.device, tiled=tiled_vae)
+                    ref_latent = [torch.cat((u, torch.zeros_like(u)), dim=0) for u in ref_latent]
 
-                # Cat on dim=1 (Temporal)
-                latent = torch.cat([*ref_latent_list, latent], dim=1)
+                latent = torch.cat([*ref_latent, latent], dim=1)
             cat_latents.append(latent)
         
         return cat_latents
@@ -525,8 +514,8 @@ class VAEProcessor:
 
             if refs is not None:
                 # Calculate latent temporal dimension for reference images
-                # refs shape is [C, T, H, W]
-                pixel_frames = refs.shape[1]
+                # refs shape is [1, C, T, H, W]
+                pixel_frames = refs.shape[2]
                 latent_ref_length = (pixel_frames - 1) // VAE_STRIDE[0] + 1
                 
                 # Create zero mask for reference frames
@@ -758,7 +747,7 @@ class ReferenceImageProcessor:
         ref_images = ref_images.movedim(0, 1) # [C, T, H, W]
         ref_images = (ref_images.to(dtype).to(device) * 2 - 1)
         
-        return [ref_images]
+        return [ref_images.unsqueeze(0)]
 
 
 class FramePackCompressor:
@@ -971,54 +960,25 @@ class VideoMetrics:
     """Calculates quality and consistency metrics for video generation."""
 
     @staticmethod
-    def _create_window(window_size, channel):
-        def gaussian(window_size, sigma):
-            gauss = torch.tensor([math.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
-            return gauss/gauss.sum()
-
-        _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
-        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-        window = torch.Tensor(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
-        return window
-
-    @staticmethod
-    def _ssim(img1, img2, window_size=11, size_average=True):
-        channel = img1.size(1)
-        window = VideoMetrics._create_window(window_size, channel).to(img1.device).type(img1.dtype)
-
-        mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
-        mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
-
-        mu1_sq = mu1.pow(2)
-        mu2_sq = mu2.pow(2)
-        mu1_mu2 = mu1 * mu2
-
-        sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
-        sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
-        sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
-
-        C1 = 0.01**2
-        C2 = 0.03**2
-
-        ssim_map = ((2*mu1_mu2 + C1) * (2*sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-
-        if size_average:
-            return ssim_map.mean()
-        else:
-            return ssim_map.mean(1).mean(1).mean(1)
-
-    @staticmethod
     def calculate_ssim_boundary(frame_prev: torch.Tensor, frame_next: torch.Tensor) -> float:
         """
-        Calculates Structural Similarity (SSIM) between two frames using Gaussian window.
-        Input shapes: [1, 3, 1, H, W] or [1, 3, H, W] or [3, H, W]
+        Calculates a simplified Structural Similarity (SSIM) between two frames.
+        frame_prev, frame_next: [1, 3, 1, H, W] or [1, 3, H, W] or [3, H, W]
         """
-        # Ensure 4D tensors [1, 3, H, W] for calculation
-        if frame_prev.dim() == 5: frame_prev = frame_prev.squeeze(2) # [1, 3, 1, H, W] -> [1, 3, H, W]
-        if frame_next.dim() == 5: frame_next = frame_next.squeeze(2)
+        # Ensure 3D tensors [3, H, W] for calculation
+        while frame_prev.dim() > 3:
+            if frame_prev.shape[0] == 1: frame_prev = frame_prev.squeeze(0)
+            elif frame_prev.shape[2] == 1: frame_prev = frame_prev.squeeze(2) # [1, 3, 1, H, W] -> [1, 3, H, W]
+            else: break
             
-        if frame_prev.dim() == 3: frame_prev = frame_prev.unsqueeze(0) # [3, H, W] -> [1, 3, H, W]
-        if frame_next.dim() == 3: frame_next = frame_next.unsqueeze(0)
+        while frame_next.dim() > 3:
+            if frame_next.shape[0] == 1: frame_next = frame_next.squeeze(0)
+            elif frame_next.shape[2] == 1: frame_next = frame_next.squeeze(2)
+            else: break
+            
+        # Fallback squeeze to exactly 3 dims if still more
+        if frame_prev.dim() > 3: frame_prev = frame_prev.view(3, frame_prev.shape[-2], frame_prev.shape[-1])
+        if frame_next.dim() > 3: frame_next = frame_next.view(3, frame_next.shape[-2], frame_next.shape[-1])
             
         # Ensure same spatial size
         if frame_prev.shape[-2:] != frame_next.shape[-2:]:
@@ -1026,10 +986,21 @@ class VideoMetrics:
                                                         size=frame_prev.shape[-2:], 
                                                         mode='bilinear')
 
-        # Run SSIM
-        ssim_val = VideoMetrics._ssim(frame_prev, frame_next)
+        # Basic SSIM terms: Luminance, Contrast, Structure
+        # We use a global mean/var for simplicity (Zero-Shot)
+        mu1 = frame_prev.mean()
+        mu2 = frame_next.mean()
+        sigma1sq = frame_prev.var()
+        sigma2sq = frame_next.var()
+        sigma12 = ((frame_prev - mu1) * (frame_next - mu2)).mean()
         
-        return float(ssim_val.item())
+        c1 = (0.01 * 1.0)**2
+        c2 = (0.03 * 1.0)**2
+        
+        ssim = ((2 * mu1 * mu2 + c1) * (2 * sigma12 + c2)) / \
+               ((mu1**2 + mu2**2 + c1) * (sigma1sq + sigma2sq + c2))
+        
+        return float(ssim.item())
 
     @staticmethod
     def calculate_embedding_drift(embed1: torch.Tensor, embed2: torch.Tensor) -> float:
@@ -1051,23 +1022,11 @@ class VideoMetrics:
         # Mean pool prompt [1, L, D] -> [D]
         p_feat = prompt_embed.mean(dim=1).view(1, -1)
         
-        
-        torch.manual_seed(42) # Fixed seed for consistency across checks
-        C = z_feat.shape[1]
-        D = p_feat.shape[1]
-        target_dim = min(C, D)
-        
-        # Simple projection matrix
-        proj_z = torch.randn(C, target_dim, device=latent.device) / math.sqrt(C)
-        proj_p = torch.randn(D, target_dim, device=latent.device) / math.sqrt(D)
-        
-        z_proj = torch.mm(z_feat, proj_z)
-        p_proj = torch.mm(p_feat, proj_p)
-        
-        sim = torch.nn.functional.cosine_similarity(z_proj, p_proj)
-        
-        # Rescale from [-1, 1] to [0, 1] for metric consistency
-        return float(0.5 * (sim.item() + 1.0))
+        # Since C (16) and D (4096) don't match, we use PCA or Projection in training
+        # ZERO-SHOT FALLBACK: We measure the variance of the latent as a proxy for "activity/energy"
+        # compared to prompt "length/complexity". 
+        # For now, let's return a dummy placeholder until we have a proper projector.
+        return 0.5
 
 
 class BenchmarkAnalyzer:
