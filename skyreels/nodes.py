@@ -1,7 +1,7 @@
 import os
 import torch
 import gc
-from ..utils import log, print_memory, fourier_filter
+from ..model_utils import log, print_memory, fourier_filter
 import math
 from tqdm import tqdm
 

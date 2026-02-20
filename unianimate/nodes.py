@@ -1,6 +1,6 @@
 
 import torch.nn as nn
-from ..utils import log
+from ..model_utils import log
 import comfy.model_management as mm
 from comfy.utils import ProgressBar
 from tqdm import tqdm

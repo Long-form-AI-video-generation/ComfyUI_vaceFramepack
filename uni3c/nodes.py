@@ -1,6 +1,6 @@
 
 import torch
-from ..utils import log
+from ..model_utils import log
 import comfy.model_management as mm
 from comfy.utils import ProgressBar, load_torch_file
 from tqdm import tqdm
